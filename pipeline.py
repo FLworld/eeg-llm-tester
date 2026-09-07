@@ -144,6 +144,18 @@ explicitly. Both l_freq and h_freq default to null; at least one must be set or 
 error.
 - "reproduce ERPLAB / MATLAB / pop_basicfilter exactly" (or match a MATLAB filter bit-for-bit) -> \
 filter_eeg engine="erplab".
+- A CONTRAST between two conditions ("A vs B", "A minus B", e.g. "faces vs cars") is NOT one \
+epoching call with a list of conditions. create_epochs.event_id and compute_erp.event_id are a \
+SINGLE label (string), never a list, and create_epochs.baseline is a boolean (true/false), never a \
+window. Build a contrast as three steps: (1) create_bins with one bin per condition -- \
+bins=[{{"label": "B1", "codes": [[lo,hi], ...]}}, {{"label": "B2", "codes": [...]}}], taking the \
+code ranges for each named condition from the scoped codebook in the context (do NOT invent codes; \
+if no codebook is present, say so in notes); (2) create_epochs with tmin/tmax and NO event_id (it \
+cuts one epoch set per bin); (3) compute_difference_erp with event_id_a="B1", event_id_b="B2" (the two bin labels) AND tmin/tmax \
+set to the SAME epoch window in seconds as create_epochs (compute_difference_erp REQUIRES tmin and \
+tmax -- never omit them). Then measure_component scores that difference wave. Use compute_erp (single \
+event_id string) only for a single-condition ERP, never for a contrast. Reminder: create_epochs.baseline \
+is a boolean -- pass true or false, never a [lo, hi] window.
 """
 
 

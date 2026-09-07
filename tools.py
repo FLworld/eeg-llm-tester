@@ -578,6 +578,8 @@ def scope_context() -> str:
     if not SCOPE.get("filepath") or SCOPE["filepath"] != SESSION.get("filepath"):
         return ""
     lines = ["Scoped recording (use these real values; do not invent channels or codes):",
+             f"- file: {SCOPE['filepath']} (use this EXACT string as load_eeg's filepath when the "
+             f"request says 'load it' / 'the recording'; never a placeholder)",
              f"- sampling rate: {SCOPE['sfreq']} Hz; {SCOPE['n_channels']} channels",
              f"- channels: {', '.join(SCOPE['ch_names'][:40])}"
              + (" ..." if len(SCOPE['ch_names']) > 40 else "")]
@@ -2652,7 +2654,7 @@ def create_bins(bins=None, require_following_code: int | None = None,
 def create_epochs(tmin: float | None = None, tmax: float | None = None,
                   event_id: str | None = None,
                   fixed_length_sec: float | None = None,
-                  baseline: bool = True, engine: str = "mne") -> dict:
+                  baseline: bool | list | None = True, engine: str = "mne") -> dict:
     """Epoch the recording. If bins were defined by create_bins, epochs are cut per bin;
     otherwise event-based from annotations by default; pass `fixed_length_sec` for
     resting-state fixed-length epochs.
@@ -2686,18 +2688,33 @@ def create_epochs(tmin: float | None = None, tmax: float | None = None,
     # ERPLAB's pre-stimulus baseline stops just before t=0; MNE's (None, 0) includes it.
     base_end = (-1.0 / raw.info["sfreq"]) if engine == "erplab" else 0
 
+    # `baseline` accepts a bool (True -> pre-stimulus window (None, base_end); False -> off) OR an
+    # explicit [lo, hi] window (MNE convention). A window in ms (|value| > 30) is converted to s;
+    # its upper edge honours the engine's t=0 convention. This tolerance exists because the planner
+    # naturally emits a window here (as measure_component uses), and a window == baseline-on.
+    def _resolve_baseline(b):
+        if isinstance(b, (list, tuple)) and len(b) == 2:
+            lo, hi = b
+            scale = 1000.0 if (abs(lo) > 30 or abs(hi) > 30) else 1.0  # ms -> s
+            lo = None if lo in (None, 0) else lo / scale
+            hi_s = hi / scale if hi not in (None,) else 0
+            # keep the engine's t=0 convention when the window ends at 0
+            hi_out = base_end if abs(hi_s) < 1e-9 else hi_s
+            return (lo, hi_out)
+        return (None, base_end) if b else None
+    base = _resolve_baseline(baseline)
+
     # Bin-aware path: if create_bins tagged events, epoch those (labelled by bin).
     binset = SESSION.get("bins")
     if binset is not None:
         events, use_id = binset["events"], dict(binset["id"])
-        base = (None, base_end) if baseline else None
         epochs = mne.Epochs(raw, events, event_id=use_id, tmin=tmin, tmax=tmax,
                             baseline=base, preload=True, verbose="ERROR")
         SESSION["epochs"] = epochs
         return {"ok": True, "mode": "binned", "n_epochs": len(epochs),
                 "per_bin": {lab: int((events[:, 2] == i).sum()) for lab, i in use_id.items()},
                 "tmin": tmin, "tmax": tmax, "engine": engine,
-                "baseline": (f"(None, {base_end})" if baseline else "off")}
+                "baseline": (str(base) if base else "off")}
 
     events, event_dict = mne.events_from_annotations(raw)
     if len(events) == 0:
@@ -2708,13 +2725,12 @@ def create_epochs(tmin: float | None = None, tmax: float | None = None,
     if event_id is not None and event_id in event_dict:
         use_id = {event_id: event_dict[event_id]}
 
-    base = (None, base_end) if baseline else None
     epochs = mne.Epochs(raw, events, event_id=use_id, tmin=tmin, tmax=tmax,
                         baseline=base, preload=True, verbose="ERROR")
     SESSION["epochs"] = epochs
     return {"ok": True, "mode": "event_based", "n_epochs": len(epochs),
             "event_ids": use_id, "tmin": tmin, "tmax": tmax, "engine": engine,
-            "baseline": (f"(None, {base_end})" if baseline else "off")}
+            "baseline": (str(base) if base else "off")}
 
 
 def delete_break_segments(time_threshold_ms: float | None = None,
@@ -3249,8 +3265,10 @@ TOOL_SCHEMAS = [
                                  "description": "Optional single annotation label to epoch."},
                     "fixed_length_sec": {"type": "number",
                                          "description": "If set, make fixed-length epochs of this duration (resting state)."},
-                    "baseline": {"type": "boolean",
-                                 "description": "Apply pre-stimulus baseline correction (event-based only)."},
+                    "baseline": {"type": ["boolean", "array"], "items": {"type": "number"},
+                                 "description": "Pre-stimulus baseline correction: true (apply the "
+                                 "pre-stimulus window) / false (off), OR an explicit [lo, hi] window "
+                                 "(MNE convention; ms or seconds)."},
                     "engine": {
                         "type": "string",
                         "enum": ["mne", "erplab"],
