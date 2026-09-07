@@ -45,6 +45,10 @@ make run       # starts the app
 
 Then open **http://127.0.0.1:8001**. (If `make doctor` is all green, you're ready.)
 
+**Option: double-click to start.** After the one-time setup, you don't need the terminal for
+day-to-day starts. On **macOS**, double-click **`Start eeg-llm.command`**; on **Linux/WSL**, run
+**`./start-eeg-llm.sh`**. It builds/pulls only if needed, checks prerequisites, and launches the app.
+
 ## Try the bundled sample
 
 ```bash
@@ -59,9 +63,12 @@ Review the drafted plan, then `/run`.
 
 ## Use your own data
 
-1. Put your recordings (`.set/.edf/.fif/.bdf/.vhdr`) into the **`data-in/`** folder next to this file.
-   Inside the app, refer to them **by name** — e.g. `/scope my-recording.set` (not the full path on
-   your computer).
+1. Get your recordings in, either way:
+   - **Drag & drop** them straight into the chat — the app saves them to `data-in/` and scopes the
+     recording automatically. For multi-file formats drag the whole set together (a `.set` with its
+     `.fdt`; a `.vhdr` with its `.eeg` + `.vmrk`).
+   - Or put them in the **`data-in/`** folder next to this file and refer to them **by name** —
+     e.g. `/scope my-recording.set` (not the full path on your computer).
 2. If your event codes aren't described by a BIDS `events.tsv`, tell it what they mean:
    ```
    /codebook {"conditions": {"target": [[1,40]], "standard": [[41,80]]}, "responses": {"correct": 201}}

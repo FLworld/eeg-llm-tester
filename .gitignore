@@ -1,5 +1,6 @@
 .venv/
 data-in/
+data-out/
 docs/
 sessions/
 batches/
@@ -10,3 +11,4 @@ __pycache__/
 **/__pycache__/
 *.pyc
 .DS_Store
+.chainlit/translations/

@@ -65,8 +65,9 @@ reaction_on_message_received = false
     #    accept = ["image/*", "audio/*", "video/*"]
     # 3. For specific file extensions:
     #    accept = { "application/octet-stream" = [".xyz", ".pdb"] }
-    # Note: Using "*/*" is not recommended as it may cause browser warnings
-    accept = ["*/*"]
+    # EEG recording formats + their sidecars (a .set needs .fdt; .vhdr needs .eeg/.vmrk).
+    # A concrete extension map avoids the "*/*" browser MIME warning.
+    accept = { "application/octet-stream" = [".set", ".fdt", ".edf", ".bdf", ".fif", ".vhdr", ".vmrk", ".eeg"] }
     max_files = 20
     max_size_mb = 500
 

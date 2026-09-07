@@ -10,6 +10,7 @@ import datetime
 import inspect
 import json
 import os
+import shutil
 
 import chainlit as cl
 import ollama
@@ -35,10 +36,12 @@ from pipeline import (
 from prompt import EEG_SYSTEM_PROMPT
 from rag import retrieve_context
 from batch import run_batch
+from exports import export_analysis
 from qc import find_lab_rules, lint_config, load_lab_rules
 from recipes import list_recipes, load_recipe, rebind_to_current, save_recipe
 from sweep import expand_sweep, run_sweep, validate_sweep
 from tools import (
+    DATA_DIR,
     SCOPE,
     SESSION,
     TOOL_FUNCTIONS,
@@ -95,6 +98,7 @@ async def start():
         [{"role": "system", "content": EEG_SYSTEM_PROMPT}],
     )
     cl.user_session.set("applied_steps", [])
+    cl.user_session.set("last_export", None)
 
     data_dir = os.environ.get("EEG_DATA_DIR", "/data")
     have_sample = os.path.exists(os.path.join(data_dir, "sub-002.set"))
@@ -126,7 +130,8 @@ async def start():
             "`/codebook {\"conditions\": {\"target\": [[1,40]], ...}}`.\n\n"
             "**Handy commands:** `/plan <pipeline>` · `/sweep <param sweep>` · "
             "`/batch <dataset-dir>` (whole cohort) · `/params <tool>` (what a tool takes) · "
-            "`/engine mne|erplab` · `/save-plan <name>` & `/recipes` (reuse). "
+            "`/engine mne|erplab` · `/export <name>` (analysis deliverable) · "
+            "`/save-plan <name>` & `/recipes` (reuse). "
             "Or just chat: *\"load my-recording.set and compute its band power.\"*"
         )
     ).send()
@@ -274,6 +279,9 @@ async def _handle_plan(request: str):
                 config = await cl.make_async(propose_pipeline)(
                     MODEL, request, _with_scope(ctx["text"]), cl.user_session.get("engine"))
 
+    # Planner telemetry is useful for the review heading, but must never become part of the
+    # runnable config displayed to or approved by the user.
+    meta = config.pop("_planner_meta", {}) if isinstance(config, dict) else {}
     errors = validate_pipeline(config)
     if errors:
         cl.user_session.set("pending_pipeline", None)
@@ -286,8 +294,10 @@ async def _handle_plan(request: str):
     cl.user_session.set("pending_pipeline", config)
     notes = config.get("notes") or []
     note_md = ("\n\n**Notes / assumptions:**\n- " + "\n- ".join(notes)) if notes else ""
+    repaired = (f" · self-corrected in {meta['attempts']} attempts"
+                if meta.get("attempts", 1) > 1 else "")
     await cl.Message(content=(
-        f"**Proposed pipeline** ({source}). Review it, then `/run` to execute "
+        f"**Proposed pipeline** ({source}{repaired}). Review it, then `/run` to execute "
         "*exactly this* (no model in the loop), or `/cancel`:\n"
         f"```json\n{format_config(config)}\n```{note_md}{_qc_block(config)}"
     )).send()
@@ -1066,6 +1076,10 @@ async def _run_sweep_and_render(spec: dict):
     summary = result.get("summary") or {}
     png = await cl.make_async(_plot_spec_curve)(rows, spec)
     elements = [_png_element(png, "sweep.png")] if png else []
+    cl.user_session.set("last_export", {
+        "kind": "sweep", "spec": spec, "results": result,
+        "images": [("specification-curve", png)] if png else [],
+    })
     content = (f"**Sweep complete — {result['n_variants']} variants.**\n\n"
                + _format_sweep_table(rows))
     if summary.get("stochastic"):
@@ -1078,6 +1092,7 @@ async def _handle_run():
     spec = cl.user_session.get("pending_sweep")
     if spec:
         cl.user_session.set("pending_sweep", None)  # consume the approval
+        cl.user_session.set("last_export", None)
         await _run_sweep_and_render(spec)
         return
     config = cl.user_session.get("pending_pipeline")
@@ -1085,6 +1100,7 @@ async def _handle_run():
         await cl.Message(content="No pending pipeline. Use `/plan <request>` first.").send()
         return
     cl.user_session.set("pending_pipeline", None)  # consume the approval
+    cl.user_session.set("last_export", None)
 
     # _run_tool is the exact dispatcher the agentic loop uses; here the (name, args)
     # pairs come from the approved config, not from the model.
@@ -1105,9 +1121,57 @@ async def _handle_run():
     await cl.Message(content=f"**{header}**\n" + "\n".join(lines),
                      elements=elements).send()
 
+    if not failed:
+        cl.user_session.set("last_export", {
+            "kind": "pipeline", "spec": config, "results": results, "images": images,
+        })
+
     narration = await cl.make_async(_narrate_results)(results)
     if narration:
         await cl.Message(content=narration).send()
+
+
+async def _handle_export(arg: str):
+    """Write the last completed `/run` as an immutable, user-visible analysis deliverable."""
+    name = arg.strip()
+    if not name:
+        await cl.Message(content=(
+            "Usage: `/export <analysis-name>` — after a successful `/run`, writes a reproducible "
+            "folder under `data-out/derivatives/eeg-llm/`."
+        )).send()
+        return
+    last = cl.user_session.get("last_export")
+    if not isinstance(last, dict):
+        await cl.Message(content=(
+            "Nothing completed to export. Run an approved `/plan` or `/sweep` first; failed "
+            "runs are intentionally not exportable as completed analyses."
+        )).send()
+        return
+
+    def _save_snapshot(path: str) -> dict:
+        return call_tool("save_eeg", {"filepath": path})
+
+    snapshot = _save_snapshot if last["kind"] == "pipeline" else None
+    async with cl.Step(name="exporting analysis", type="tool") as step:
+        result = await cl.make_async(export_analysis)(
+            name=name,
+            kind=last["kind"],
+            spec=last["spec"],
+            results=last["results"],
+            scope=dict(SCOPE),
+            images=last.get("images"),
+            save_snapshot=snapshot,
+        )
+        step.output = json.dumps(result, indent=2, default=str)
+    if not result.get("ok"):
+        await cl.Message(content=f"**Export failed:** {result.get('error', 'unknown error')}").send()
+        return
+    await cl.Message(content=(
+        f"**Export complete.** Open `data-out/{result['relative_path']}`.\n"
+        f"- configuration, scope, results, and report saved\n"
+        f"- processed data: `{result.get('data_file') or 'not applicable for a sweep'}`\n"
+        f"- figures: {len(result.get('figures') or [])}"
+    )).send()
 
 
 async def _handle_save(arg: str):
@@ -1177,9 +1241,59 @@ async def _handle_resume(arg: str):
     )).send()
 
 
+_RECORDING_EXTS = (".set", ".edf", ".fif", ".bdf", ".vhdr")
+# sidecars that must accompany a main recording (dragged together)
+_SIDECAR_EXTS = (".fdt", ".eeg", ".vmrk")
+
+
+async def _handle_uploads(msg: cl.Message) -> bool:
+    """Save dragged/uploaded files into DATA_DIR and auto-scope the primary recording.
+
+    Returns True if any files were handled. Multi-file formats (a .set needs its .fdt; a .vhdr
+    needs .eeg + .vmrk) work by dragging the whole group at once -- all are saved, the primary
+    recording is scoped. A lone sidecar (no main file) is reported, not silently ignored.
+    """
+    files = [(el.name, el.path) for el in (msg.elements or [])
+             if getattr(el, "path", None) and getattr(el, "name", None)]
+    if not files:
+        return False
+    os.makedirs(DATA_DIR, exist_ok=True)
+    saved = []
+    for name, path in files:
+        try:
+            dest = os.path.join(DATA_DIR, os.path.basename(name))
+            shutil.copy(path, dest)
+            saved.append(os.path.basename(name))
+        except Exception as e:
+            await cl.Message(content=f"**Upload failed** for `{name}`: {e}").send()
+    if not saved:
+        return True
+    recordings = [n for n in saved if n.lower().endswith(_RECORDING_EXTS)]
+    listed = ", ".join(f"`{n}`" for n in saved)
+    if not recordings:
+        await cl.Message(content=(
+            f"Received {listed} into `data-in/`, but that's a **sidecar** with no main recording. "
+            f"Drag the main file too (`.set` with its `.fdt`; `.vhdr` with `.eeg`+`.vmrk`), "
+            f"then I can scope it.")).send()
+        return True
+    primary = recordings[0]
+    extra = ""
+    if len(recordings) > 1:
+        extra = f" (scoping the first; others: {', '.join(recordings[1:])})"
+    await cl.Message(content=f"Saved {listed} into `data-in/`. Scoping `{primary}`{extra}…").send()
+    await _handle_scope(primary)
+    return True
+
+
 @cl.on_message
 async def on_message(msg: cl.Message):
     text = msg.content.strip()
+
+    # --- uploaded/dragged files: save into DATA_DIR + auto-scope the primary recording ---
+    if msg.elements:
+        handled = await _handle_uploads(msg)
+        if handled and not text:
+            return
 
     # --- deterministic pipeline commands (you dictate, code executes) ---
     if text.startswith("/params"):
@@ -1218,6 +1332,9 @@ async def on_message(msg: cl.Message):
         return
     if text.startswith("/run"):
         await _handle_run()
+        return
+    if text.startswith("/export"):
+        await _handle_export(text[len("/export"):].strip())
         return
     if text.startswith("/save"):
         await _handle_save(text[len("/save"):].strip())

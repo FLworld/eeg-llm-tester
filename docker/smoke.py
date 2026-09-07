@@ -40,7 +40,7 @@ def imports():
 
 
 def app_modules():
-    import tools, pipeline, sweep, recipes, batch, qc, rag  # noqa: F401
+    import tools, pipeline, sweep, recipes, batch, qc, rag, exports  # noqa: F401
 
 
 # Feature-conservation anchor: the shipped tool catalog must match the dev build exactly, so a

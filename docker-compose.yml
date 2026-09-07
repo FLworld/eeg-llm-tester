@@ -25,6 +25,8 @@ services:
     volumes:
       # Your recordings — drop files here on the host, reference them by name in the app.
       - ./data-in:/data
+      # Immutable analysis deliverables written by /export (never alters raw input data).
+      - ./data-out:/output
       # Optional: your reference PDFs for the RAG knowledge base (then: make ingest).
       - ./docs:/app/docs
       # Persistent app state (sessions, recipes, batches, model caches) across restarts.
