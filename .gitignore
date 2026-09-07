@@ -1,0 +1,12 @@
+.venv/
+data-in/
+docs/
+sessions/
+batches/
+recipes/
+eeg_knowledge/
+*.tar.gz
+__pycache__/
+**/__pycache__/
+*.pyc
+.DS_Store

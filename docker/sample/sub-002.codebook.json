@@ -1,0 +1,12 @@
+{
+  "conditions": {
+    "face": [[1, 40]],
+    "car": [[41, 80]],
+    "scrambled_face": [[101, 140]],
+    "scrambled_car": [[141, 180]]
+  },
+  "responses": {
+    "correct": 201,
+    "incorrect": 202
+  }
+}

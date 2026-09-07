@@ -1,0 +1,35 @@
+# eeg-llm — one-command run surface for testers.
+# The LLM runs in Ollama on your HOST; this container is just the app and talks to it.
+# Usage:  make setup   (once, pulls models on the host)
+#         make run      (docker compose up)
+# Then open http://127.0.0.1:8001
+
+services:
+  eeg-llm:
+    # Local build by default; set EEG_IMAGE to a registry ref (e.g. ghcr.io/<you>/eeg-llm:latest)
+    # to run a pulled image instead of building.
+    image: "${EEG_IMAGE:-eeg-llm:latest}"
+    build: .
+    # Loopback only — this is a local tool, never exposed to your network.
+    # Override APP_PORT if 8001 is taken on your machine.
+    ports:
+      - "127.0.0.1:${APP_PORT:-8001}:8001"
+    environment:
+      # Where the app reaches Ollama. Override in a .env file if Ollama runs elsewhere.
+      OLLAMA_HOST: "${OLLAMA_HOST:-http://host.docker.internal:11434}"
+      # Optional Chainlit password gate; unset = no auth (fine for a local machine).
+      APP_PASSWORD: "${APP_PASSWORD:-}"
+    # Lets the container resolve the host's Ollama on Linux; harmless on Docker Desktop.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Your recordings — drop files here on the host, reference them by name in the app.
+      - ./data-in:/data
+      # Optional: your reference PDFs for the RAG knowledge base (then: make ingest).
+      - ./docs:/app/docs
+      # Persistent app state (sessions, recipes, batches, model caches) across restarts.
+      - eeg-state:/state
+    restart: unless-stopped
+
+volumes:
+  eeg-state:

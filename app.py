@@ -1,0 +1,1341 @@
+"""Chainlit chat app wiring the EEG model, RAG, and MNE tools together.
+
+Run with:  chainlit run app.py --port 8000
+"""
+
+from __future__ import annotations
+
+import base64
+import datetime
+import inspect
+import json
+import os
+
+import chainlit as cl
+import ollama
+
+import sys as _sys
+
+# Guarantee this directory is on sys.path before importing project modules, so their lazy
+# sibling imports (e.g. artifact_break_removal) resolve no matter how chainlit launches us
+# or what the cwd is at tool-call time.
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from pipeline import (
+    describe_tool,
+    extract_inline_tool_calls,
+    format_config,
+    list_tool_names,
+    propose_pipeline,
+    propose_sweep,
+    run_pipeline,
+    try_parse_config,
+    validate_pipeline,
+)
+from prompt import EEG_SYSTEM_PROMPT
+from rag import retrieve_context
+from batch import run_batch
+from qc import find_lab_rules, lint_config, load_lab_rules
+from recipes import list_recipes, load_recipe, rebind_to_current, save_recipe
+from sweep import expand_sweep, run_sweep, validate_sweep
+from tools import (
+    SCOPE,
+    SESSION,
+    TOOL_FUNCTIONS,
+    TOOL_SCHEMAS,
+    call_tool,
+    compare_to_checkpoint,
+    scope_context,
+    scope_eeg,
+    set_codebook,
+)
+
+MODEL = "eeg-qwen"
+MAX_TOOL_ROUNDS = 6
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# Runtime state root. Defaults to the app dir; set STATE_DIR (e.g. a mounted volume) so
+# sessions/recipes/batches persist across container restarts.
+STATE_DIR = os.environ.get("STATE_DIR", _HERE)
+SESSIONS_DIR = os.path.join(STATE_DIR, "sessions")
+# Lab conventions supervised by the QC linter (a lab-wide lab_rules.json/yaml, auto-loaded if present).
+LAB_RULES, LAB_RULES_PATH = find_lab_rules(_HERE)
+
+# Optional password gate for a shared machine. Unset APP_PASSWORD => no auth (the default;
+# the app is bound to loopback anyway). When set, any username + this password logs in.
+if os.environ.get("APP_PASSWORD"):
+    import hashlib
+    os.environ.setdefault(
+        "CHAINLIT_AUTH_SECRET",
+        hashlib.sha256(("eeg-llm:" + os.environ["APP_PASSWORD"]).encode()).hexdigest(),
+    )
+
+    @cl.password_auth_callback
+    def _auth(username: str, password: str):
+        if password == os.environ["APP_PASSWORD"]:
+            return cl.User(identifier=username or "tester")
+        return None
+
+
+def _qc_block(config: dict) -> str:
+    """QC-linter warnings for a drafted plan/sweep, as a non-blocking review-card section (or '')."""
+    warnings = lint_config(config, SCOPE if SCOPE.get("filepath") else None, LAB_RULES)
+    if not warnings:
+        return ""
+    return "\n\n**⚠ QC checks (review — not blocking):**\n- " + "\n- ".join(warnings)
+
+
+def _png_element(b64: str, name: str) -> cl.Image:
+    return cl.Image(content=base64.b64decode(b64), name=name, display="inline")
+
+
+@cl.on_chat_start
+async def start():
+    cl.user_session.set(
+        "history",
+        [{"role": "system", "content": EEG_SYSTEM_PROMPT}],
+    )
+    cl.user_session.set("applied_steps", [])
+
+    data_dir = os.environ.get("EEG_DATA_DIR", "/data")
+    have_sample = os.path.exists(os.path.join(data_dir, "sub-002.set"))
+    if have_sample:
+        sample_block = (
+            "**1 · Try the bundled sample** (ERP CORE N170):\n"
+            "```\n"
+            "/scope sub-002.set\n"
+            "/plan load it, band-pass 0.1-30 Hz, average reference, epoch faces vs cars, "
+            "measure the N170 at PO8\n"
+            "```\n"
+            "Review the drafted plan, then `/run` to execute exactly that (or `/cancel`).\n\n"
+        )
+    else:
+        sample_block = (
+            "**1 · Get a sample to try** (optional): run `make fetch-sample` on your machine, "
+            "then `/scope sub-002.set`.\n\n"
+        )
+
+    await cl.Message(
+        content=(
+            "**EEG assistant ready.** I load recordings and run filtering, ICA, ERP, PSD, "
+            "AutoReject and more via MNE-Python — you drive, I draft; nothing runs until you "
+            "approve it.\n\n"
+            + sample_block +
+            "**2 · Use your own data:** drop recordings into the **`data-in/`** folder on your "
+            "computer, then reference them by name — e.g. `/scope my-recording.set`. If your "
+            "event codes aren't in a BIDS `events.tsv`, define what they mean with "
+            "`/codebook {\"conditions\": {\"target\": [[1,40]], ...}}`.\n\n"
+            "**Handy commands:** `/plan <pipeline>` · `/sweep <param sweep>` · "
+            "`/batch <dataset-dir>` (whole cohort) · `/params <tool>` (what a tool takes) · "
+            "`/engine mne|erplab` · `/save-plan <name>` & `/recipes` (reuse). "
+            "Or just chat: *\"load my-recording.set and compute its band power.\"*"
+        )
+    ).send()
+
+
+def _effective_params(name: str, args: dict) -> tuple[list[str], list[str]]:
+    """Split a call into (model-supplied, silently-defaulted) 'key=value' strings.
+
+    Reads the tool function's signature so defaults the model DID NOT pass are made
+    explicit -- the point being that the model's own prose is an unreliable audit of
+    what actually ran. Works for any tool with no per-tool wiring.
+    """
+    fn = TOOL_FUNCTIONS.get(name)
+    supplied, defaulted = [], []
+    if fn is None:
+        return [f"{k}={v!r}" for k, v in (args or {}).items()], []
+    for pname, p in inspect.signature(fn).parameters.items():
+        if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+            continue
+        if pname in (args or {}):
+            supplied.append(f"{pname}={args[pname]!r}")
+        elif p.default is not inspect.Parameter.empty:
+            defaulted.append(f"{pname}={p.default!r}")
+    return supplied, defaulted
+
+
+def _applied_line(result: dict) -> str:
+    """A compact line of runtime-computed effective values worth surfacing."""
+    if not isinstance(result, dict):
+        return ""
+    bits = []
+    aa = result.get("aa_filter")
+    if isinstance(aa, dict):
+        bits.append(f"aa_filter: {aa.get('num_taps')} taps, phase={aa.get('phase')!r}, "
+                    f"cutoff={aa.get('cutoff_hz')} Hz")
+    if result.get("applied_shift_samples") is not None:
+        bits.append(f"applied shift: {result['applied_shift_samples']} samples "
+                    f"({result.get('applied_shift_ms')} ms, rounding={result.get('rounding')!r})")
+    if result.get("dc_window_samples") is not None:
+        bits.append(f"remove_dc: {result['dc_window_samples']}-sample window "
+                    f"over {result.get('dc_n_segments')} segment(s)")
+    if result.get("engine") == "erplab" and result.get("filt_n_segments") is not None:
+        bits.append(f"engine=erplab: b,a filtfilt ({result.get('filt_band')}, "
+                    f"design order {result.get('design_order')} = effective "
+                    f"{result.get('iir_order')}), {result.get('filt_pad_samples')}-sample pad "
+                    f"over {result.get('filt_n_segments')} segment(s)")
+    return "  ·  ".join(bits)
+
+
+async def _run_tool(name: str, args: dict) -> dict:
+    """Execute a tool in a worker thread and surface its figure (if any)."""
+    async with cl.Step(name=f"tool: {name}", type="tool") as step:
+        step.input = args
+        result = await cl.make_async(call_tool)(name, args)
+
+        # Detach any image so it isn't shipped back to the model as raw base64.
+        image_b64 = result.pop("image", None)
+        step.output = json.dumps(result, indent=2, default=str)[:4000]
+        if image_b64:
+            step.elements = [_png_element(image_b64, f"{name}.png")]
+            await step.update()
+
+    # Always-visible effective-params summary (not a collapsed step): the complete
+    # parameterization, with silently-applied defaults flagged, independent of the model.
+    supplied, defaulted = _effective_params(name, args)
+    lines = [f"🔧 **{name}**(" + ", ".join(supplied) + ")"]
+    if defaulted:
+        lines.append("· defaults applied: " + ", ".join(defaulted))
+    applied = _applied_line(result)
+    if applied:
+        lines.append("· " + applied)
+    await cl.Message(content="\n".join(lines), author="params").send()
+
+    # Record successful, state-affecting calls as a replayable config for /save (provenance).
+    # Both the agentic loop and the deterministic /run path funnel through here.
+    if name != "save_eeg" and not (isinstance(result, dict) and result.get("ok") is False):
+        steps = cl.user_session.get("applied_steps") or []
+        steps.append({"tool": name, "args": args})
+        cl.user_session.set("applied_steps", steps)
+
+    return result, image_b64
+
+
+def _narrate_results(results: list[dict]) -> str:
+    """Plain-language interpretation of a deterministic run's numeric results.
+
+    Read-only: the model sees the results (minus images) and explains them. It
+    cannot change what ran -- this is narration after the fact, not a tool loop.
+    """
+    payload = json.dumps(
+        [
+            {
+                "tool": r["tool"],
+                "args": r["args"],
+                "result": (
+                    {k: v for k, v in r["result"].items() if k != "image"}
+                    if isinstance(r["result"], dict) else r["result"]
+                ),
+            }
+            for r in results
+        ],
+        default=str,
+    )[:6000]
+    resp = ollama.chat(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": EEG_SYSTEM_PROMPT},
+            {"role": "user", "content": (
+                "These EEG tools were just executed deterministically from an "
+                "approved plan. Interpret the numeric results for the user in plain "
+                "language. Do NOT propose new steps.\n\n" + payload
+            )},
+        ],
+    )
+    return (resp["message"].get("content") or "").strip()
+
+
+async def _handle_plan(request: str):
+    """Draft a pipeline config from the request, validate it, and stage it for /run."""
+    if not request:
+        await cl.Message(content=(
+            "Usage: `/plan <what to run>` — e.g. `/plan load /data/sub-01.edf, "
+            "band-pass 1-40 Hz, notch 50, average reference, then PSD`\n\n"
+            "Or paste a JSON config directly (no model involved): "
+            "`/plan {\"pipeline\": [{\"tool\": \"load_eeg\", \"args\": "
+            "{\"filepath\": \"/data/sub-01.edf\"}}]}`"
+        )).send()
+        return
+
+    # Model-free path: if the user pasted a JSON config, use it verbatim.
+    config = try_parse_config(request)
+    source = "your config (verbatim, no model)"
+    if config is None:
+        rec = load_recipe(request, kind="plan")  # a saved recipe name? (slug match, no model)
+        if rec is not None:
+            config = rebind_to_current(rec["spec"], SESSION.get("filepath"))
+            source = f"saved recipe '{rec['name']}' (rebound to the current recording)"
+            if not SESSION.get("filepath"):
+                await cl.Message(content="⚠ No recording loaded — `/scope <file>` first so the "
+                                 "recipe runs on your data.").send()
+        else:
+            source = "drafted by the assistant — check it for missing or extra steps"
+            ctx = await cl.make_async(retrieve_context)(request)
+            async with cl.Step(name="planning", type="llm"):
+                config = await cl.make_async(propose_pipeline)(
+                    MODEL, request, _with_scope(ctx["text"]), cl.user_session.get("engine"))
+
+    errors = validate_pipeline(config)
+    if errors:
+        cl.user_session.set("pending_pipeline", None)
+        await cl.Message(content=(
+            "**Could not build a valid pipeline:**\n- " + "\n- ".join(errors)
+            + "\n\nRefine the request and `/plan` again."
+        )).send()
+        return
+
+    cl.user_session.set("pending_pipeline", config)
+    notes = config.get("notes") or []
+    note_md = ("\n\n**Notes / assumptions:**\n- " + "\n- ".join(notes)) if notes else ""
+    await cl.Message(content=(
+        f"**Proposed pipeline** ({source}). Review it, then `/run` to execute "
+        "*exactly this* (no model in the loop), or `/cancel`:\n"
+        f"```json\n{format_config(config)}\n```{note_md}{_qc_block(config)}"
+    )).send()
+
+
+async def _handle_compare(arg: str):
+    """Deterministic, out-of-band verification: score the CURRENT session data against an
+    ERP CORE checkpoint. The model is NOT involved and never sees ERP CORE specifics -- this
+    is the experimenter checking the data the model produced from natural language alone.
+
+    Usage: /compare <checkpoint> [mean] [bipolar] [chan=PO8]
+      checkpoint : shifted_ds | reref_ucbip | hpfilt | <path to .set>
+      mean       : use the mean-correlation gate (looser; for filtered data)
+      bipolar    : compare the bipolar EOG channels instead of the scalp channels
+      chan=NAME  : channel to draw in the overlay plot (default PO8)
+    """
+    toks = arg.split()
+    if not toks:
+        await cl.Message(content=(
+            "Usage: `/compare <checkpoint> [mean] [bipolar] [chan=PO8]`\n"
+            "- checkpoint: `shifted_ds`, `reref_ucbip`, `hpfilt`, or a path to a .set file\n"
+            "- `mean`: looser correlation-only gate (for filtered data)\n"
+            "- `bipolar`: compare the bipolar EOG channels\n"
+            "- `chan=NAME`: channel for the overlay plot (default PO8)\n\n"
+            "This scores the data currently in the session against the checkpoint — the "
+            "model is not involved."
+        )).send()
+        return
+
+    checkpoint = toks[0]
+    gate = "mean" if any(t in ("mean", "gate=mean") for t in toks[1:]) else "tight"
+    bipolar = any(t == "bipolar" for t in toks[1:])
+    plot_channel = next((t.split("=", 1)[1] for t in toks[1:] if t.startswith("chan=")), "PO8")
+
+    async with cl.Step(name=f"compare vs {checkpoint}", type="tool") as step:
+        step.input = {"checkpoint": checkpoint, "gate": gate,
+                      "bipolar": bipolar, "plot_channel": plot_channel}
+        res = await cl.make_async(compare_to_checkpoint)(
+            checkpoint=checkpoint, gate=gate, bipolar=bipolar, plot_channel=plot_channel)
+        image_b64 = res.pop("image", None)
+        step.output = json.dumps(res, indent=2, default=str)[:4000]
+
+    if not res.get("ok"):
+        await cl.Message(content=f"**Compare failed:** {res.get('error')}").send()
+        return
+
+    lines = [
+        f"**Compared current data vs `{res['checkpoint']}` — verdict: {res['verdict']}** "
+        f"_(gate: {res['gate']})_",
+        f"- channels: {res['n_channels']}  |  samples: {res['n_samples']}",
+        f"- min r = {res['min_r']}  |  mean r = {res['mean_r']}  |  "
+        f"worst max|Δ| = {res['worst_max_abs_diff_uV']} µV",
+        "",
+        "| channel | Pearson r | max|Δ| (µV) |",
+        "|---|---:|---:|",
+    ]
+    lines += [f"| {r['channel']} | {r['pearson_r']:.6f} | {r['max_abs_diff_uV']:.4f} |"
+              for r in res["rows"]]
+    elements = [_png_element(image_b64, "compare.png")] if image_b64 else []
+    await cl.Message(content="\n".join(lines), elements=elements).send()
+
+
+async def _handle_tune(arg: str):
+    """Interactive artifact-threshold tuning, in-chat (Plotly). Runs the ERPLAB
+    peak-to-peak detector on the CURRENTLY LOADED continuous recording at the given
+    threshold, renders the p2p envelope vs ampth with flagged spans shaded, and lists
+    the triggering channels. Works on any data; shows a Kappenman-overlap verdict only
+    when the ERP CORE sub-002 prep1 checkpoint is loaded."""
+    import mne
+    import plotly.graph_objects as go
+
+    from artifact_continuous_detect import (
+        continuous_artifact_detect,
+        reconstruct_deleted_spans,
+        span_overlap,
+        windowed_p2p_envelope,
+    )
+
+    raw = SESSION.get("raw")
+    if raw is None or not isinstance(raw, mne.io.BaseRaw):
+        await cl.Message(content=(
+            "`/tune` needs a continuous recording loaded. Load one first "
+            "(`load_eeg`), then `/tune <ampth_uV> [winms=500] [stepms=50]`."
+        )).send()
+        return
+    toks = arg.split()
+    if not toks:
+        await cl.Message(content=(
+            "Usage: `/tune <ampth_uV> [winms=500] [stepms=50]`\n"
+            "Flags continuous segments whose peak-to-peak amplitude exceeds `ampth` "
+            "(moving window) on the loaded recording. Lower `ampth` = more aggressive."
+        )).send()
+        return
+    try:
+        ampth = float(toks[0])
+        winms = float(toks[1]) if len(toks) > 1 else 500.0
+        stepms = float(toks[2]) if len(toks) > 2 else 50.0
+    except ValueError:
+        await cl.Message(content="`ampth/winms/stepms` must be numbers, e.g. `/tune 300 500 50`.").send()
+        return
+
+    # scan real signal channels only (avoid stim/misc blowing up peak-to-peak)
+    picks = mne.pick_types(raw.info, eeg=True, eog=True, exclude=[])
+    chan_array = list(picks) if len(picks) else list(range(len(raw.ch_names)))
+    fs = float(raw.info["sfreq"])
+
+    async with cl.Step(name=f"tune ampth={ampth}", type="tool") as step:
+        step.input = {"ampth": ampth, "winms": winms, "stepms": stepms,
+                      "n_channels_scanned": len(chan_array)}
+        res = await cl.make_async(continuous_artifact_detect)(
+            raw, ampth=ampth, winms=winms, stepms=stepms, chan_array=chan_array)
+        centres, env = await cl.make_async(windowed_p2p_envelope)(
+            raw, winms, stepms, chan_array)
+        step.output = {"n_segments": res["n_segments"], "pct_removed": res["pct_removed"]}
+
+    spans = res["deleted_spans"]
+
+    # conditional Kappenman verdict (only when ERP CORE sub-002 prep1 is loaded)
+    verdict_line = None
+    fp = SESSION.get("filepath") or ""
+    if "erpcore_n170" in fp and "ica_prep1" in os.path.basename(fp):
+        prep2 = fp.replace("ica_prep1", "ica_prep2")
+        if os.path.exists(prep2):
+            gt_spans, _ = await cl.make_async(reconstruct_deleted_spans)(prep2, fp)
+            ov = span_overlap(spans, gt_spans, res["n_times"])
+            if ov["a_samples"] == 0 and ov["b_samples"] == 0:
+                verdict = "matches ERP CORE (both cut nothing)"
+            elif ov["iou"] >= 0.5:
+                verdict = "about right"
+            elif ov["a_samples"] > ov["b_samples"]:
+                verdict = "over-cutting vs Kappenman"
+            else:
+                verdict = "under-cutting vs Kappenman"
+            verdict_line = (f"- **vs Kappenman:** IoU={ov['iou']}, you cut "
+                            f"{ov['a_samples']} vs their {ov['b_samples']} samples "
+                            f"→ **{verdict}**")
+
+    # Plotly: p2p envelope vs ampth, flagged spans shaded
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=centres, y=env, mode="lines",
+                             name="max peak-to-peak (µV)", line=dict(width=1)))
+    fig.add_hline(y=ampth, line_dash="dash", line_color="orange",
+                  annotation_text=f"ampth = {ampth} µV")
+    for s, e in spans:
+        fig.add_vrect(x0=s / fs, x1=e / fs, fillcolor="red", opacity=0.25, line_width=0)
+    fig.update_layout(template="plotly_dark", height=420,
+                      title=f"/tune  ampth={ampth} winms={winms} stepms={stepms} "
+                            f"— {res['pct_removed']}% removed",
+                      xaxis_title="Time (s)", yaxis_title="peak-to-peak (µV)",
+                      margin=dict(l=60, r=20, t=50, b=45))
+
+    lines = [
+        f"**/tune** ampth={ampth} µV, winms={winms}, stepms={stepms} "
+        f"(scanned {len(chan_array)} channels)",
+        f"- **{res['n_segments']} segment(s)** flagged, {res['total_ms_removed']} ms "
+        f"= **{res['pct_removed']}% removed**",
+    ]
+    for i, (s, e) in enumerate(spans[:8]):
+        trig = res["triggers_per_span"][i][:4]
+        trig_txt = ", ".join(f"{n} ({v:.0f}µV)" for n, v in trig) or "—"
+        lines.append(f"  - {s / fs:.2f}–{e / fs:.2f}s ← {trig_txt}")
+    if len(spans) > 8:
+        lines.append(f"  … and {len(spans) - 8} more span(s)")
+    if verdict_line:
+        lines.append(verdict_line)
+    lines.append("_Re-run `/tune` with a new ampth to iterate. Cut gross muscle/offsets; "
+                 "keep blinks & eye movements (ICA models those)._")
+
+    await cl.Message(content="\n".join(lines),
+                     elements=[cl.Plotly(name="tune", figure=fig, display="inline")]).send()
+
+
+def _with_scope(ctx_text: str | None) -> str | None:
+    """Prepend the scoped-recording summary (channels, sfreq, codebook) to the planner context
+    so it names real channels and builds create_bins from the real code->condition map."""
+    scope = scope_context()
+    if not scope:
+        return ctx_text
+    return f"{scope}\n\n----\n{ctx_text}" if ctx_text else scope
+
+
+async def _handle_scope(arg: str):
+    """Scope a recording: read structure + resolve the event code->condition map (onboarding)."""
+    path = arg.strip()
+    if not path:
+        await cl.Message(content=(
+            "Usage: `/scope /path/to/recording.set` — reads channels, sampling rate, and the "
+            "event-code inventory, and resolves a codebook (BIDS events.tsv, or a saved "
+            "`<name>.codebook.json`). Then `/plan` and `/sweep` know your real channels and "
+            "condition codes."
+        )).send()
+        return
+    async with cl.Step(name="scope", type="tool"):
+        res = await cl.make_async(scope_eeg)(path)
+    if not res.get("ok"):
+        await cl.Message(content=f"**Scope failed:** {res.get('error', 'unknown')}").send()
+        return
+    lines = [f"**Scoped** `{os.path.basename(path)}` ({res['kind']}).",
+             f"- {res['n_channels']} channels @ {res['sfreq']} Hz",
+             f"- {res['n_event_codes']} distinct event codes"]
+    cb, src = res.get("codebook"), res.get("codebook_source")
+    if cb and cb.get("conditions"):
+        conds = ", ".join(cb["conditions"].keys())
+        lines.append(f"- **codebook** ({src}): conditions = {conds}")
+        if src == "bids":
+            lines.append("  ⚠ from BIDS `trial_type` — may be coarse (e.g. 'stimulus'). Refine "
+                         "with `/codebook {\"conditions\": {...}}` if you need finer bins.")
+    else:
+        lines.append("- **no codebook** — I can read the codes but not what they MEAN. Provide "
+                     "one with `/codebook {\"conditions\": {\"face\": [[1,40]], ...}, "
+                     "\"responses\": {\"correct\": 201}}` (saved for reuse), or drop a "
+                     "`<name>.codebook.json` beside the file.")
+    for w in res.get("warnings") or []:
+        lines.append(f"- ⚠ {w}")
+    await cl.Message(content="\n".join(lines)).send()
+
+
+async def _handle_codebook(arg: str):
+    """Set / show the event code->condition map for the scoped recording (Option A / B)."""
+    text = arg.strip()
+    if not text:
+        cur = scope_context()
+        await cl.Message(content=(
+            "**Current scope / codebook:**\n```\n" + (cur or "(nothing scoped — /scope first)")
+            + "\n```\nSet one by pasting JSON: `/codebook {\"conditions\": {\"face\": [[1,40]], "
+            "\"car\": [[41,80]]}, \"responses\": {\"correct\": 201}}`"
+        )).send()
+        return
+    try:
+        cb = json.loads(text)
+    except json.JSONDecodeError:
+        await cl.Message(content="Could not parse the codebook JSON. Expected "
+                         "`{\"conditions\": {...}, \"responses\": {...}}`.").send()
+        return
+    res = await cl.make_async(set_codebook)(cb.get("conditions"), cb.get("responses"), True)
+    if not res.get("ok"):
+        await cl.Message(content=f"**Codebook rejected:** {res.get('error')}").send()
+        return
+    msg = "**Codebook set and saved** (reused next session)."
+    if res.get("warnings"):
+        msg += "\n" + "\n".join(f"- ⚠ {w}" for w in res["warnings"])
+    await cl.Message(content=msg + "\n\n```\n" + scope_context() + "\n```").send()
+
+
+async def _handle_lab_rules(arg: str):
+    """Show or load the lab conventions the QC linter enforces. `/lab-rules` shows the active
+    set; `/lab-rules <path>` loads a lab_rules.(json|yaml). These are supervised deterministically
+    and surfaced as review-card warnings on every /plan and /sweep (non-blocking)."""
+    global LAB_RULES, LAB_RULES_PATH
+    path = arg.strip()
+    if path:
+        rules = await cl.make_async(load_lab_rules)(path)
+        if rules is None:
+            await cl.Message(content=f"Could not load lab rules from `{path}` "
+                             "(expected a JSON/YAML file).").send()
+            return
+        LAB_RULES, LAB_RULES_PATH = rules, path
+    if not LAB_RULES:
+        await cl.Message(content=(
+            "No lab rules active. Drop a `lab_rules.json` (or `.yaml`) next to `app.py`, or "
+            "`/lab-rules /path/to/lab_rules.yaml`. Supported keys: `require_steps`, `forbid_steps`, "
+            "`order`, `require_before`, `param_equals`. The QC linter always also checks the "
+            "built-in universal traps (filter-after-epoch, reref-after-ICA, absent channels/codes)."
+        )).send()
+        return
+    body = json.dumps(LAB_RULES, indent=2, default=str)
+    src = f" (from `{LAB_RULES_PATH}`)" if LAB_RULES_PATH else ""
+    await cl.Message(content=f"**Active lab rules**{src} — enforced on every `/plan` and `/sweep`:"
+                     f"\n```json\n{body}\n```").send()
+
+
+def _fmt_default(v) -> str:
+    """Render a default value for display."""
+    if v is None:
+        return "null"
+    if isinstance(v, str):
+        return f'"{v}"'
+    return str(v)
+
+
+async def _handle_params(arg: str):
+    """Deterministic tool reference: which parameters a tool needs and their defaults.
+
+    `/params` lists tools; `/params <tool>` shows each parameter, whether it is REQUIRED (you
+    must state it) or optional (with its DEFAULT, applied if you omit it). Read straight from the
+    registry + function signature -- reliable, no model. Lets a user know exactly what to specify
+    in a `/plan`, and that omitting a parameter (or saying 'use the defaults') applies the default.
+    """
+    name = arg.strip()
+    if not name:
+        names = ", ".join(sorted(list_tool_names()))
+        await cl.Message(content=(
+            "**`/params <tool>`** — see a tool's parameters, which are required, and their "
+            f"defaults.\n\nTools: {names}"
+        )).send()
+        return
+    info = await cl.make_async(describe_tool)(name)
+    if not info.get("ok"):
+        sugg = ", ".join(info.get("suggestions") or [])
+        await cl.Message(content=f"{info.get('error')} Did you mean: {sugg}?").send()
+        return
+
+    req = [p for p in info["params"] if p["required"]]
+    opt = [p for p in info["params"] if not p["required"]]
+    out = [f"**`{info['name']}`** — {info['description']}", ""]
+    if req:
+        out.append("**Required** (you must specify these):")
+        for p in req:
+            t = f" _{p['type']}_" if p.get("type") else ""
+            out.append(f"- **`{p['name']}`**{t} — {p['description']}")
+    else:
+        out.append("**Required:** none.")
+    out.append("")
+    out.append("**Optional** (default applies if you omit it — or just say \"use the defaults\"):")
+    for p in opt:
+        t = f" _{p['type']}_" if p.get("type") else ""
+        dflt = _fmt_default(p["default"]) if p["has_default"] else "—"
+        out.append(f"- `{p['name']}`{t} — default `{dflt}` — {p['description']}")
+    out.append("")
+    out.append("_Specify only what you need in `/plan`; anything omitted uses the default above._")
+    await cl.Message(content="\n".join(out)).send()
+
+
+# Friendly aliases → tool names, so a free-text param question can name a tool casually.
+# ORDER MATTERS: specific phrases before general ones (checked in insertion order), so
+# "apply ica" resolves to apply_ica rather than run_ica, "difference wave" to the diff-ERP, etc.
+# Only fires once a param-question trigger is present, so broad words here are low-risk.
+_TOOL_ALIASES = {
+    # --- I/O ---
+    "load recording": "load_eeg", "load the recording": "load_eeg", "load data": "load_eeg",
+    "load file": "load_eeg", "import recording": "load_eeg",
+    "save recording": "save_eeg", "export recording": "save_eeg", "save to disk": "save_eeg",
+    # --- filtering / resample / line noise ---
+    "band-pass": "filter_eeg", "bandpass": "filter_eeg", "band pass": "filter_eeg",
+    "high-pass": "filter_eeg", "highpass": "filter_eeg", "low-pass": "filter_eeg",
+    "lowpass": "filter_eeg", "notch filter": "filter_eeg", "filter": "filter_eeg",
+    "downsample": "resample", "down-sample": "resample", "sampling rate": "resample",
+    "sample rate": "resample", "resampling": "resample",
+    "line noise": "remove_line_noise", "zapline": "remove_line_noise",
+    "powerline": "remove_line_noise", "power-line": "remove_line_noise",
+    # --- referencing / events / channels ---
+    "re-reference": "set_reference", "rereference": "set_reference", "reref": "set_reference",
+    "average reference": "set_reference", "linked mastoid": "set_reference",
+    "mastoid": "set_reference", "reference": "set_reference",
+    "event shift": "shift_events", "shift events": "shift_events", "shift the events": "shift_events",
+    "channel type": "set_channel_types", "channel types": "set_channel_types",
+    "set channel": "set_channel_types", "mark eog": "set_channel_types",
+    "bipolar eog": "derive_bipolar_eog", "bipolar": "derive_bipolar_eog",
+    "heog": "derive_bipolar_eog", "veog": "derive_bipolar_eog",
+    # --- bad channels / interpolation / robust ref ---
+    "interpolate": "interpolate_bads", "interpolation": "interpolate_bads",
+    "interp": "interpolate_bads", "faster": "run_faster",
+    "pyprep": "run_prep", "robust reference": "run_prep", "prep pipeline": "run_prep",
+    "prep": "run_prep",
+    # --- artifact detection / rejection / ASR / autoreject ---
+    "extreme value": "detect_artifacts_extreme_value", "voltage threshold": "detect_artifacts_extreme_value",
+    "moving window": "detect_artifacts_moving_window", "peak-to-peak": "detect_artifacts_moving_window",
+    "peak to peak": "detect_artifacts_moving_window", "crap": "detect_artifacts_moving_window",
+    "step-like": "detect_artifacts_step", "step detection": "detect_artifacts_step",
+    "step artifact": "detect_artifacts_step", "saccade": "detect_artifacts_step",
+    "reject flagged": "reject_flagged_epochs", "reject epochs": "reject_flagged_epochs",
+    "drop epochs": "reject_flagged_epochs",
+    "auto-reject": "run_autoreject", "autoreject": "run_autoreject", "auto reject": "run_autoreject",
+    "artifact subspace": "run_asr", "clean_rawdata": "run_asr", "clean rawdata": "run_asr",
+    "asr": "run_asr",
+    # --- break / continuous cleaning ---
+    "break segment": "delete_break_segments", "remove break": "delete_break_segments",
+    "delete break": "delete_break_segments", "breaks": "delete_break_segments",
+    "continuous artifact": "continuous_artifact_detect",
+    # --- binning / epoching ---
+    "binlister": "create_bins", "binning": "create_bins", "bins": "create_bins",
+    "epoching": "create_epochs", "epoch": "create_epochs", "epochs": "create_epochs",
+    # --- ICA ---
+    "apply ica": "apply_ica", "remove components": "apply_ica", "ocular correction": "apply_ica",
+    "component removal": "apply_ica",
+    "load ica": "load_ica_eeglab", "precomputed ica": "load_ica_eeglab", "eeglab ica": "load_ica_eeglab",
+    "independent component": "run_ica", "ica": "run_ica",
+    # --- spectral / ERP / analysis ---
+    "band power": "compute_psd", "power spectral": "compute_psd", "power spectrum": "compute_psd",
+    "spectral density": "compute_psd", "psd": "compute_psd",
+    "difference wave": "compute_difference_erp", "difference erp": "compute_difference_erp",
+    "diff wave": "compute_difference_erp",
+    "evoked response": "compute_erp", "event-related potential": "compute_erp",
+    "event related potential": "compute_erp", "erp": "compute_erp",
+    "measure component": "measure_component", "peak amplitude": "measure_component",
+    "mean amplitude": "measure_component", "measure": "measure_component",
+    "aperiodic": "run_fooof", "specparam": "run_fooof", "fooof": "run_fooof", "1/f": "run_fooof",
+    "connectivity": "compute_connectivity", "coherence": "compute_connectivity",
+    "wpli": "compute_connectivity", "sift": "compute_connectivity",
+    "microstate": "compute_microstates", "microstates": "compute_microstates",
+    "pycrostates": "compute_microstates",
+}
+
+# Strong param-question wording: rarely appears in an imperative run request, so it may also
+# trigger the "which tool did you mean?" list when no tool is named.
+_PARAM_STRONG = ("parameter", "argument", " params ", " args ",
+                 "defaults for", "defaults of", "default value", "default for", "default of")
+# Weaker / more adjacent wording: only fires when a real tool is ALSO named (else it would be
+# too easy to hijack ordinary chat). Never asks on its own.
+_PARAM_WEAK = ("options for", "option for", "settings for", "setting for",
+               "how do i use", "how to use", "how do you use", " inputs for ",
+               "help with", "help for", "how do i configure", "how to configure")
+_VERB_LEAD = ("what does", "what can", "what do")
+_VERB_OBJ = (" take", " takes", " need", " needs", " accept", " accepts",
+             " require", " requires", " expect", " expects")
+
+
+def _find_tool_in(t: str) -> str | None:
+    """First tool referenced in `t` (space-padded, lowercased): exact name/spaced form, then
+    a casual alias (specific→general by insertion order)."""
+    for name in list_tool_names():
+        if name in t or name.replace("_", " ") in t:
+            return name
+    for alias, name in _TOOL_ALIASES.items():
+        if alias in t:
+            return name
+    return None
+
+
+def _detect_params_query(text: str) -> str | None:
+    """Detect a free-text 'what parameters/defaults does <tool> take?' question, so the answer
+    comes from the DETERMINISTIC `/params` reference instead of the model's memory.
+
+    Returns a tool name, "ASK" (a strong param question with no tool named → list tools), or
+    None (not a param question → normal chat). Tiered so it will not hijack a real command:
+    STRONG wording may ASK; WEAK/adjacent wording only fires if a tool is also named.
+    """
+    t = f" {text.lower().strip()} "
+    strong = any(k in t for k in _PARAM_STRONG)
+    weak = any(k in t for k in _PARAM_WEAK)
+    verby = any(k in t for k in _VERB_LEAD) and any(k in t for k in _VERB_OBJ)
+    if not (strong or weak or verby):
+        return None
+    tool = _find_tool_in(t)
+    if tool:
+        return tool
+    return "ASK" if strong else None   # weak/verb wording without a tool -> normal chat
+
+
+ENGINE_CHOICES = {"mne", "erplab", "eeglab", "eeglab-python"}
+
+
+async def _handle_engine(arg: str):
+    """Set (or show/clear) the session toolbox-convention default for the planner.
+
+    `/engine erplab` -> the planner passes engine='erplab' on engine-capable tools unless a
+    request names a different toolbox for a step. `/engine` shows current; `/engine none`
+    clears it. Explicit and reviewable; never auto-detected (per _core/CONVENTIONS.md).
+    """
+    val = arg.strip().lower()
+    if not val:
+        cur = cl.user_session.get("engine")
+        await cl.Message(content=(
+            f"Session engine default: **{cur or 'none'}** (tools fall back to their own "
+            "default, `mne`). Set with `/engine mne` or `/engine erplab`; clear with "
+            "`/engine none`."
+        )).send()
+        return
+    if val in ("none", "clear", "off"):
+        cl.user_session.set("engine", None)
+        await cl.Message(content="Cleared the session engine default.").send()
+        return
+    if val not in ENGINE_CHOICES:
+        await cl.Message(content=(
+            f"Unknown engine '{val}'. Choose one of: {', '.join(sorted(ENGINE_CHOICES))}."
+        )).send()
+        return
+    cl.user_session.set("engine", val)
+    await cl.Message(content=(
+        f"Session engine default set to **{val}**. New `/plan` and `/sweep` drafts will use "
+        f"engine='{val}' on engine-capable tools unless a request names a different toolbox. "
+        "You can still override per step."
+    )).send()
+
+
+def _try_parse_sweep(text: str) -> dict | None:
+    """If `text` is a JSON sweep spec the user pasted, return it (model-free path)."""
+    t = text.strip()
+    if not t.startswith("{"):
+        return None
+    try:
+        obj = json.loads(t)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) and "base_pipeline" in obj else None
+
+
+async def _handle_save_recipe(kind: str, name: str):
+    """Save the currently-staged sweep/plan under a name, for reuse via `/sweep <name>` or
+    `/plan <name>`. Usage: `/save-sweep <name>` (after `/sweep`), `/save-plan <name>`."""
+    if not name:
+        await cl.Message(content=f"Usage: `/save-{kind} <name>` — first `/{kind} ...` to draft "
+                         f"one, then name it. e.g. `/save-{kind} filter sweep`.").send()
+        return
+    staged = cl.user_session.get("pending_sweep" if kind == "sweep" else "pending_pipeline")
+    if not staged:
+        await cl.Message(content=f"Nothing to save — `/{kind} ...` first, review it, then "
+                         f"`/save-{kind} {name}`.").send()
+        return
+    res = await cl.make_async(save_recipe)(name, kind, staged)
+    if not res.get("ok"):
+        await cl.Message(content=f"**Could not save:** {res.get('error')}").send()
+        return
+    await cl.Message(content=(
+        f"**Saved {kind} recipe** `{res['slug']}`. Reuse it anytime with "
+        f"`/{kind} {res['slug']}` (it rebinds to whatever recording you have loaded). "
+        "See all with `/recipes`."
+    )).send()
+
+
+async def _handle_recipes():
+    """List saved recipes."""
+    recs = await cl.make_async(list_recipes)()
+    if not recs:
+        await cl.Message(content="No saved recipes yet. Draft a `/sweep` or `/plan`, then "
+                         "`/save-sweep <name>` / `/save-plan <name>`.").send()
+        return
+    lines = ["**Saved recipes** (run with `/sweep <name>` or `/plan <name>`):"]
+    for r in recs:
+        lines.append(f"- **{r['slug']}** ({r['kind']}) — {r['summary']}")
+    await cl.Message(content="\n".join(lines)).send()
+
+
+def _format_batch_table(rows: list[dict]) -> str:
+    """Per-subject QC table: sub | trials | interp | comps | endpoint uV | status."""
+    has_lat = any(r.get("latency_ms") is not None for r in rows)
+    head = ["subject", "trials", "interp", "comps", "endpoint µV"]
+    if has_lat:
+        head.append("latency ms")
+    head.append("status")
+    out = ["| " + " | ".join(head) + " |", "| " + " | ".join(["---"] * len(head)) + " |"]
+    for r in rows:
+        qc = r.get("qc", {})
+        trials = qc.get("n_kept", qc.get("n_epochs"))
+        cells = [r["sub"],
+                 "—" if trials is None else str(trials),
+                 str(qc.get("n_interpolated", "—")),
+                 str(qc.get("n_components", "—")),
+                 "—" if r.get("endpoint_uv") is None else f"{r['endpoint_uv']:.3f}"]
+        if has_lat:
+            cells.append("—" if r.get("latency_ms") is None else f"{r['latency_ms']:.0f}")
+        if r.get("ok"):
+            flags = r.get("outlier_flags") or []
+            cells.append("✅" if not flags else "⚠ " + "; ".join(flags))
+        else:
+            cells.append(f"❌ {str(r.get('error', ''))[:44]}")
+        out.append("| " + " | ".join(cells) + " |")
+    return "\n".join(out)
+
+
+async def _handle_batch(arg: str):
+    """Run a plan across every subject in a BIDS dataset. Usage:
+    `/batch [recipe-name] <dataset-dir>` — a saved plan recipe, or the staged /plan if omitted."""
+    parts = arg.split()
+    if not parts:
+        await cl.Message(content=(
+            "Usage: `/batch [recipe-name] <dataset-dir>` — run a plan on every `sub-*/` in a "
+            "BIDS dataset.\n- `/batch n170 data/erpcore_n170` uses a saved recipe (`/save-plan n170`)\n"
+            "- `/batch data/erpcore_n170` uses the plan you just `/plan`-ned (staged).\n"
+            "The plan should end in `measure_component` (that's the per-subject endpoint)."
+        )).send()
+        return
+
+    # Resolve the plan spec: last arg is the dataset dir; an optional first arg is a recipe name.
+    dataset_dir = parts[-1]
+    spec = None
+    source = ""
+    if len(parts) >= 2:
+        rec = load_recipe(" ".join(parts[:-1]), kind="plan")
+        if rec is None:
+            await cl.Message(content=f"No saved plan recipe named "
+                             f"`{' '.join(parts[:-1])}`. See `/recipes`, or omit the name to "
+                             "use your staged `/plan`.").send()
+            return
+        spec, source = {"pipeline": rec["spec"].get("pipeline", [])}, f"recipe '{rec['name']}'"
+    else:
+        staged = cl.user_session.get("pending_pipeline")
+        if not staged:
+            await cl.Message(content="No staged plan and no recipe named. `/plan ...` first (then "
+                             "optionally `/save-plan <name>`), or pass a recipe name.").send()
+            return
+        spec, source = staged, "your staged plan"
+
+    if not _endpoint_in_plan(spec):
+        await cl.Message(content="⚠ The plan has no `measure_component` step, so there's no "
+                         "per-subject endpoint to tabulate. Add one, or expect an empty endpoint "
+                         "column.").send()
+
+    await cl.Message(content=f"**Running batch** ({source}) over `{dataset_dir}` — this runs the "
+                     "pipeline on every subject and may take a while…").send()
+    result = await cl.make_async(_run_batch_sync)(spec, dataset_dir)
+    if not result.get("ok"):
+        await cl.Message(content=f"**Batch could not run:** {result.get('error')}").send()
+        return
+
+    rows, agg = result["rows"], result["aggregate"]
+    content = [f"**Batch complete** — {result['n_subjects']} subjects "
+               f"({agg.get('n_ok', 0)} ok). Saved to `{result['out_dir']}`.", "",
+               _format_batch_table(rows)]
+    ep = agg.get("endpoint")
+    if ep:
+        content += ["", f"**Endpoint across subjects:** mean {ep['mean_uv']:.3f} µV, "
+                    f"sd {ep['sd_uv']:.3f} µV (n={ep['n']})."]
+        outliers = [f"{r['sub']} ({'; '.join(r['outlier_flags'])})"
+                    for r in rows if r.get("outlier_flags")]
+        content.append("**Outliers:** " + (", ".join(outliers) if outliers else "none."))
+    ga = agg.get("grand_average")
+    if ga:
+        line = f"**Grand average:** {ga['n_subjects']} subjects, {ga['n_channels']} channels"
+        if ga.get("endpoint_uv") is not None:
+            line += f"; group endpoint {ga['endpoint_uv']:.3f} µV"
+        content.append(line)
+    elements = ([_png_element(result["grand_average_png"], "grand_average.png")]
+                if result.get("grand_average_png") else [])
+    await cl.Message(content="\n".join(content), elements=elements).send()
+
+
+def _endpoint_in_plan(spec: dict) -> bool:
+    return any(isinstance(s, dict) and s.get("tool") == "measure_component"
+              for s in (spec.get("pipeline") or []))
+
+
+def _run_batch_sync(spec: dict, dataset_dir: str) -> dict:
+    """Bridge: run_batch is async, but per-subject steps run through a plain synchronous dispatcher
+    (not _run_tool) so a many-subject run doesn't flood the UI with hundreds of step messages.
+    Called via cl.make_async, i.e. on a worker thread with no running loop, so asyncio.run is safe."""
+    import asyncio
+
+    async def _step(name, args):
+        return call_tool(name, args or {}), None
+
+    return asyncio.run(run_batch(spec, dataset_dir, _step))
+
+
+async def _handle_sweep(request: str):
+    """Draft a parameter-sweep spec, validate it, show the grid, and stage it for /run."""
+    if not request:
+        await cl.Message(content=(
+            "Usage: `/sweep <what to vary>` — e.g. `/sweep load /data/sub-002.set, "
+            "band-pass 0.1-40 Hz, sweep the high-pass over 0.1, 0.5, 1.0, then measure the "
+            "N170 mean over 110-150 ms at PO8`\n\n"
+            "Or paste a JSON sweep spec directly (no model): "
+            "`/sweep {\"base_pipeline\": [...], \"axes\": [...], \"endpoint\": {...}}`"
+        )).send()
+        return
+
+    spec = _try_parse_sweep(request)
+    source = "your spec (verbatim, no model)"
+    if spec is None:
+        rec = load_recipe(request, kind="sweep")  # a saved recipe name? (slug match, no model)
+        if rec is not None:
+            spec = rebind_to_current(rec["spec"], SESSION.get("filepath"))
+            source = f"saved recipe '{rec['name']}' (rebound to the current recording)"
+            if not SESSION.get("filepath"):
+                await cl.Message(content="⚠ No recording loaded — `/scope <file>` first so the "
+                                 "recipe runs on your data.").send()
+        else:
+            source = "drafted by the assistant — check the base pipeline, axes, and endpoint"
+            ctx = await cl.make_async(retrieve_context)(request)
+            async with cl.Step(name="planning sweep", type="llm"):
+                spec = await cl.make_async(propose_sweep)(
+                    MODEL, request, _with_scope(ctx["text"]), cl.user_session.get("engine"))
+
+    # Separate the planner telemetry (attempts / decline) from the spec before display/run.
+    meta = spec.pop("_planner_meta", {}) if isinstance(spec, dict) else {}
+    if meta.get("declined"):
+        cl.user_session.set("pending_sweep", None)
+        why = "; ".join(spec.get("notes") or []) or "no sweepable parameter was identified"
+        await cl.Message(content=(
+            f"**This doesn't look like a sweep** ({why}). A sweep varies a *parameter of a "
+            "tool* (a filter cutoff, an ICA seed, ...). If you meant to run a fixed pipeline, "
+            "use `/plan`; otherwise name the parameter and the values to try."
+        )).send()
+        return
+
+    errors = validate_sweep(spec)
+    if errors:
+        cl.user_session.set("pending_sweep", None)
+        tried = f" (after {meta['attempts']} attempts)" if meta.get("attempts", 1) > 1 else ""
+        await cl.Message(content=(
+            f"**Could not build a valid sweep{tried}:**\n- " + "\n- ".join(errors)
+            + "\n\nRefine the request and `/sweep` again."
+        )).send()
+        return
+
+    repaired = (f" · self-corrected in {meta['attempts']} attempts"
+                if meta.get("attempts", 1) > 1 else "")
+
+    variants, _ = expand_sweep(spec)
+    cl.user_session.set("pending_sweep", spec)
+    grid = "\n".join(f"{i + 1}. {v['label']}" for i, v in enumerate(variants))
+    notes = spec.get("notes") or []
+    note_md = ("\n\n**Notes / assumptions:**\n- " + "\n- ".join(notes)) if notes else ""
+    await cl.Message(content=(
+        f"**Proposed sweep** ({source}{repaired}) — **{len(variants)} variants**. Review, then "
+        "`/run` to execute *exactly this* (no model in the loop), or `/cancel`:\n"
+        f"```json\n{format_config(spec)}\n```\n**Variants:**\n{grid}{note_md}{_qc_block(spec)}"
+    )).send()
+
+
+def _format_sweep_table(rows: list[dict]) -> str:
+    """Markdown comparison table: one row per variant."""
+    has_lat = any(r.get("latency_ms") is not None for r in rows)
+    has_ref = any(r.get("vs_ref_r") is not None for r in rows)
+    head = ["variant", "endpoint µV"]
+    if has_lat:
+        head.append("latency ms")
+    if has_ref:
+        head.append("vs-ref r")
+    head.append("status")
+    out = ["| " + " | ".join(head) + " |", "| " + " | ".join(["---"] * len(head)) + " |"]
+    for r in rows:
+        cells = [r.get("label") or "(base)",
+                 "—" if r.get("endpoint_uv") is None else f"{r['endpoint_uv']:.3f}"]
+        if has_lat:
+            cells.append("—" if r.get("latency_ms") is None else f"{r['latency_ms']:.0f}")
+        if has_ref:
+            cells.append("—" if r.get("vs_ref_r") is None else f"{r['vs_ref_r']:.4f}")
+        cells.append("✅" if r.get("ok") else f"❌ {str(r.get('error', ''))[:50]}")
+        out.append("| " + " | ".join(cells) + " |")
+    return "\n".join(out)
+
+
+def _format_stochastic(stochastic: list[dict]) -> str:
+    lines = ["**Stochastic (repeat) spread — uncertainty from the random step:**"]
+    for g in stochastic:
+        grp = g["group"] if isinstance(g["group"], str) else \
+            ", ".join(f"{k}={v}" for k, v in g["group"].items())
+        lines.append(f"- {grp or '(all seeds)'}: mean {g['mean_uv']:.3f} µV, "
+                     f"sd {g['sd_uv']:.3f} µV, spread {g['spread_uv']:.3f} µV (N={g['n']})")
+    return "\n".join(lines)
+
+
+def _plot_spec_curve(rows: list[dict], spec: dict) -> str | None:
+    """Specification curve: endpoint vs the swept value (line if a single numeric axis,
+    else a bar per variant). Returns a base64 PNG, or None if nothing to plot."""
+    import io
+    import matplotlib.pyplot as plt
+
+    pts = [(r, r["endpoint_uv"]) for r in rows if r.get("endpoint_uv") is not None]
+    if not pts:
+        return None
+    axes = spec.get("axes") or []
+    single_numeric = (len(axes) == 1 and axes[0].get("values")
+                      and all(isinstance(v, (int, float)) for v in axes[0]["values"]))
+    fig, ax = plt.subplots(figsize=(6.2, 3.6))
+    if single_numeric:
+        param = f"{axes[0]['tool']}.{axes[0]['param']}"
+        xy = sorted((list(r["assignments"].values())[0], y) for r, y in pts)
+        ax.plot([x for x, _ in xy], [y for _, y in xy], "o-")
+        ax.set_xlabel(param)
+    else:
+        labels = [r["label"] for r, _ in pts]
+        ax.bar(range(len(pts)), [y for _, y in pts])
+        ax.set_xticks(range(len(pts)))
+        ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=7)
+    ax.set_ylabel("endpoint (µV)")
+    ax.set_title("Specification curve")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=110)
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+async def _run_sweep_and_render(spec: dict):
+    """Execute a staged sweep and render the comparison table + specification curve."""
+    result = await run_sweep(spec, _run_tool)
+    if not result.get("ok"):
+        await cl.Message(content=(
+            "**Sweep could not run:**\n- " + "\n- ".join(result.get("errors", ["unknown"]))
+        )).send()
+        return
+    rows = result["rows"]
+    summary = result.get("summary") or {}
+    png = await cl.make_async(_plot_spec_curve)(rows, spec)
+    elements = [_png_element(png, "sweep.png")] if png else []
+    content = (f"**Sweep complete — {result['n_variants']} variants.**\n\n"
+               + _format_sweep_table(rows))
+    if summary.get("stochastic"):
+        content += "\n\n" + _format_stochastic(summary["stochastic"])
+    await cl.Message(content=content, elements=elements).send()
+
+
+async def _handle_run():
+    """Execute the staged pipeline (or sweep) deterministically through the dispatcher."""
+    spec = cl.user_session.get("pending_sweep")
+    if spec:
+        cl.user_session.set("pending_sweep", None)  # consume the approval
+        await _run_sweep_and_render(spec)
+        return
+    config = cl.user_session.get("pending_pipeline")
+    if not config:
+        await cl.Message(content="No pending pipeline. Use `/plan <request>` first.").send()
+        return
+    cl.user_session.set("pending_pipeline", None)  # consume the approval
+
+    # _run_tool is the exact dispatcher the agentic loop uses; here the (name, args)
+    # pairs come from the approved config, not from the model.
+    results, images = await run_pipeline(config, _run_tool)
+
+    elements = [_png_element(b64, f"{name}.png") for name, b64 in images]
+    failed = any(
+        isinstance(r["result"], dict) and r["result"].get("ok") is False
+        for r in results
+    )
+    lines = []
+    for r in results:
+        res = r["result"]
+        ok = res.get("ok") if isinstance(res, dict) else None
+        mark = "✅" if ok else "❌"
+        lines.append(f"{mark} `{r['tool']}` {json.dumps(r['args'], default=str)}")
+    header = "Pipeline stopped at a failing step." if failed else "Pipeline completed."
+    await cl.Message(content=f"**{header}**\n" + "\n".join(lines),
+                     elements=elements).send()
+
+    narration = await cl.make_async(_narrate_results)(results)
+    if narration:
+        await cl.Message(content=narration).send()
+
+
+async def _handle_save(arg: str):
+    """Checkpoint the current processed data (.fif snapshot) + the replayable applied-step
+    config, so work survives a dashboard restart. Usage: /save <name>."""
+    name = arg.split()[0] if arg.split() else ""
+    if not name:
+        await cl.Message(content="Usage: `/save <name>` — checkpoints current data + applied "
+                                 "steps to `sessions/<name>/`.").send()
+        return
+    if SESSION.get("raw") is None and SESSION.get("epochs") is None:
+        await cl.Message(content="Nothing to save — load and process a recording first.").send()
+        return
+    dest = os.path.join(SESSIONS_DIR, name)
+    os.makedirs(dest, exist_ok=True)
+    res = await cl.make_async(call_tool)("save_eeg", {"filepath": os.path.join(dest, "state.fif")})
+    if not res.get("ok"):
+        await cl.Message(content=f"**Save failed:** {res.get('error')}").send()
+        return
+    steps = cl.user_session.get("applied_steps") or []
+    with open(os.path.join(dest, "pipeline.json"), "w") as f:
+        json.dump({"pipeline": steps}, f, indent=2, default=str)
+    meta = {"name": name, "kind": res.get("applied_to"), "sfreq": res.get("sfreq"),
+            "n_steps": len(steps), "state_file": os.path.basename(res["saved"]),
+            "saved_at": datetime.datetime.now().isoformat(timespec="seconds")}
+    with open(os.path.join(dest, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+    await cl.Message(content=(
+        f"**Checkpoint `{name}` saved.**\n"
+        f"- state: `{res['saved']}`\n"
+        f"- steps recorded: {len(steps)}\n"
+        f"- resume any time (even after a restart) with `/resume {name}`"
+    )).send()
+
+
+async def _handle_resume(arg: str):
+    """Reload a saved checkpoint: restores the processed data and prints its applied-step
+    provenance. Usage: /resume <name> (bare /resume lists checkpoints)."""
+    name = arg.split()[0] if arg.split() else ""
+    if not name:
+        avail = sorted(os.listdir(SESSIONS_DIR)) if os.path.isdir(SESSIONS_DIR) else []
+        listing = "\n".join(f"- `{a}`" for a in avail) or "_none saved yet_"
+        await cl.Message(content=f"Usage: `/resume <name>`. Saved checkpoints:\n{listing}").send()
+        return
+    dest = os.path.join(SESSIONS_DIR, name)
+    meta_path = os.path.join(dest, "meta.json")
+    if not os.path.isfile(meta_path):
+        await cl.Message(content=f"No checkpoint named `{name}` in `{SESSIONS_DIR}`.").send()
+        return
+    with open(meta_path) as f:
+        meta = json.load(f)
+    res = await cl.make_async(call_tool)(
+        "load_eeg", {"filepath": os.path.join(dest, meta["state_file"])})
+    if not res.get("ok"):
+        await cl.Message(content=f"**Resume failed:** {res.get('error')}").send()
+        return
+    with open(os.path.join(dest, "pipeline.json")) as f:
+        steps = json.load(f).get("pipeline", [])
+    cl.user_session.set("applied_steps", steps)
+    prov = "\n".join(f"{i + 1}. `{s['tool']}` {json.dumps(s.get('args', {}), default=str)}"
+                     for i, s in enumerate(steps)) or "_no recorded steps_"
+    await cl.Message(content=(
+        f"**Resumed checkpoint `{name}`** (saved {meta.get('saved_at')}).\n"
+        f"- loaded `{meta['state_file']}` — kind={res.get('kind')}, sfreq={res.get('sfreq')}\n\n"
+        f"**Applied-step provenance:**\n{prov}\n\n"
+        "Continue processing from here, or `/compare` to verify."
+    )).send()
+
+
+@cl.on_message
+async def on_message(msg: cl.Message):
+    text = msg.content.strip()
+
+    # --- deterministic pipeline commands (you dictate, code executes) ---
+    if text.startswith("/params"):
+        await _handle_params(text[len("/params"):].strip())
+        return
+    if text.startswith("/lab-rules"):
+        await _handle_lab_rules(text[len("/lab-rules"):].strip())
+        return
+    if text.startswith("/scope"):
+        await _handle_scope(text[len("/scope"):].strip())
+        return
+    if text.startswith("/codebook"):
+        await _handle_codebook(text[len("/codebook"):].strip())
+        return
+    if text.startswith("/engine"):
+        await _handle_engine(text[len("/engine"):].strip())
+        return
+    # recipe save-verbs must precede /save (prefix) and /sweep,/plan
+    if text.startswith("/save-sweep"):
+        await _handle_save_recipe("sweep", text[len("/save-sweep"):].strip())
+        return
+    if text.startswith("/save-plan"):
+        await _handle_save_recipe("plan", text[len("/save-plan"):].strip())
+        return
+    if text.startswith("/recipes"):
+        await _handle_recipes()
+        return
+    if text.startswith("/batch"):
+        await _handle_batch(text[len("/batch"):].strip())
+        return
+    if text.startswith("/sweep"):
+        await _handle_sweep(text[len("/sweep"):].strip())
+        return
+    if text.startswith("/plan"):
+        await _handle_plan(text[len("/plan"):].strip())
+        return
+    if text.startswith("/run"):
+        await _handle_run()
+        return
+    if text.startswith("/save"):
+        await _handle_save(text[len("/save"):].strip())
+        return
+    if text.startswith("/resume"):
+        await _handle_resume(text[len("/resume"):].strip())
+        return
+    if text.startswith("/cancel"):
+        cl.user_session.set("pending_pipeline", None)
+        cl.user_session.set("pending_sweep", None)
+        await cl.Message(content="Cancelled the pending pipeline / sweep.").send()
+        return
+    if text.startswith("/compare"):
+        await _handle_compare(text[len("/compare"):].strip())
+        return
+    if text.startswith("/tune"):
+        await _handle_tune(text[len("/tune"):].strip())
+        return
+
+    # Reliable free-text shortcut: a "what parameters/defaults does <tool> take?" question is
+    # answered from the deterministic /params reference, never the model's memory.
+    detected = _detect_params_query(text)
+    if detected == "ASK":
+        await _handle_params("")
+        return
+    if detected:
+        await _handle_params(detected)
+        return
+
+    # --- agentic chat (the model decides what to run) ---
+    await _handle_agentic(msg)
+
+
+async def _handle_agentic(msg: cl.Message):
+    history: list = cl.user_session.get("history")
+
+    # --- RAG: inject retrieved context for this turn ---
+    ctx = await cl.make_async(retrieve_context)(msg.content)
+    user_content = msg.content
+    if ctx["text"]:
+        user_content = (
+            "Context (from the local EEG knowledge base):\n"
+            f"{ctx['text']}\n\n"
+            "----\n"
+            f"User question: {msg.content}"
+        )
+    history.append({"role": "user", "content": user_content})
+
+    pending_images: list[cl.Image] = []
+
+    # --- tool-calling loop (non-streaming so tool_calls parse cleanly) ---
+    # final_text holds the model's natural-language answer once it stops calling tools.
+    final_text = None
+    for _ in range(MAX_TOOL_ROUNDS):
+        resp = await cl.make_async(ollama.chat)(
+            model=MODEL, messages=history, tools=TOOL_SCHEMAS,
+        )
+        message = resp["message"]
+        tool_calls = message.get("tool_calls") or []
+
+        # Coder models often emit the call as ```json text instead of native
+        # tool_calls; recover it so the call actually runs.
+        if not tool_calls:
+            tool_calls = extract_inline_tool_calls(message.get("content") or "")
+
+        if not tool_calls:
+            # The model answered in text — this is the final response.
+            final_text = (message.get("content") or "").strip()
+            if final_text:
+                history.append({"role": "assistant", "content": final_text})
+            break
+
+        history.append(message)  # keep the tool-call turn for context
+        for tc in tool_calls:
+            fn = tc["function"]
+            args = fn.get("arguments") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            result, image_b64 = await _run_tool(fn["name"], args)
+            if image_b64:
+                pending_images.append(_png_element(image_b64, f"{fn['name']}.png"))
+            history.append({
+                "role": "tool",
+                "name": fn["name"],
+                "content": json.dumps(result, default=str)[:4000],
+            })
+    else:
+        history.append({
+            "role": "user",
+            "content": "Tool budget exhausted. Summarise findings so far for the user.",
+        })
+
+    # --- emit the answer ---
+    out = cl.Message(content="", elements=pending_images)
+    await out.send()
+
+    if final_text:
+        full = final_text
+        out.content = full
+        await out.update()
+    else:
+        # Budget exhausted, or the model returned an empty final turn:
+        # stream a fresh natural-language answer.
+        full = ""
+        stream = await cl.make_async(ollama.chat)(
+            model=MODEL, messages=history, stream=True,
+        )
+        for part in stream:
+            token = part["message"]["content"]
+            if token:
+                full += token
+                await out.stream_token(token)
+        history.append({"role": "assistant", "content": full})
+
+    if ctx["sources"]:
+        full += "\n\n*Sources: " + ", ".join(ctx["sources"]) + "*"
+        out.content = full
+        await out.update()

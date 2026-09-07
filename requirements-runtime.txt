@@ -1,0 +1,49 @@
+# eeg-llm RUNTIME requirements — what the app needs to RUN (used by the Docker image).
+# Derived from requirements.txt, minus the development / validation / desktop-only deps:
+#   - oct2py / octave_kernel / metakernel : genuine runica.m validation path (dev only)
+#   - playwright                          : browser UI tests (dev only)
+#   - PyQt5 / mne-qt-browser              : interactive desktop plotting (headless server never uses it)
+# The science-stack pins are IDENTICAL to requirements.txt — the whole point of shipping a frozen
+# image is that `scipy<1.14` (sph_harm) and the arm64/numpy caveats resolve ONCE, here, not on a
+# tester's machine. Do not loosen a pin without rebuilding + re-running the release-gate tests.
+
+# LLM + embeddings (all local via Ollama)
+ollama>=0.3.3
+langchain-ollama>=0.2.0
+
+# Vector store + retrieval
+chromadb>=0.5.5
+chroma-hnswlib          # arm64 sometimes needs it explicitly; pin it in so the build is deterministic
+rank-bm25>=0.2.2
+
+# Document ingestion
+pymupdf>=1.24.0         # PDF text extraction (imported as `fitz`)
+
+# EEG / signal processing
+mne>=1.6,<1.8
+mne-icalabel>=0.7
+autoreject>=0.4.3
+scikit-learn>=1.3
+scipy>=1.11,<1.14       # scipy>=1.17 removed scipy.special.sph_harm, which mne/autoreject/icalabel import
+numpy>=1.26,<2.0        # numpy 2 still trips some mne/numba stacks
+matplotlib>=3.8
+
+# EEGLAB-equivalent ecosystem (real user tools drive these)
+asrpy>=0.0.3            # ASR (clean_rawdata)
+pyprep>=0.4.3          # PREP robust referencing + bad-channel detection
+mne-connectivity>=0.6  # connectivity (SIFT-equivalent)
+pycrostates>=0.5       # microstates
+fooof>=1.1             # spectral parameterisation
+yasa>=0.6.4            # sleep staging + spectral tools
+mne-bids>=0.14         # BIDS dataset I/O
+eeglabio>=0.0.2        # read/write EEGLAB .set
+mne-features>=0.3      # feature extraction
+antropy>=0.1.6         # entropy / complexity
+pyriemann>=0.6         # Riemannian geometry / BCI decoding
+tensorpac>=0.6.5       # phase-amplitude coupling
+neurokit2>=0.2.7       # physiological signals
+meegkit>=0.1.9         # Zapline line-noise removal (run_zapline tool)
+mne-faster>=1.2        # FASTER artifact detection (run_faster tool)
+
+# UI
+chainlit>=1.1.0

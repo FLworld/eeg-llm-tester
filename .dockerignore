@@ -1,0 +1,39 @@
+# The Dockerfile uses an explicit allowlist COPY, so this is belt-and-suspenders: even a stray
+# `COPY .` could never pull in the dev/audit layer or data. Keep the build context small too.
+
+# dev / audit layer (also lives mostly at the workspace root, outside this context)
+docs_dev/
+reproduce/
+_core/
+templates/
+session notes/
+CLAUDE.md
+ROUTING.md
+README_DEV.md
+TROUBLESHOOTING.md
+
+# tests, scripts, validation machinery — never shipped
+tests/
+scripts/
+ica_eeglab.py
+erpcore_compare.py
+
+# heavy / private / regenerated
+.venv/
+data/
+docs/
+batches/
+sessions/
+recipes/
+data-in/
+__pycache__/
+**/__pycache__/
+*.pyc
+.chainlit/translations/
+.git/
+.gitignore
+*.md
+!chainlit.md
+
+# keep these OUT of context but they're referenced by the build explicitly
+.DS_Store
