@@ -129,6 +129,10 @@ empty list to signal "unused" -- leave it out.
 - If a recording must be loaded and none is loaded yet, the first step is load_eeg.
 - Put every assumption you made, and every required parameter you had to leave to the tool \
 default, into "notes" so the human can catch it at review.
+- If a REQUIRED parameter has no default and the user did NOT specify it (e.g. run_ica's \
+`algorithm`), you must choose a valid value to keep the plan runnable -- but that is a scientific \
+choice the user did not make, so you MUST record it in "notes" explicitly, e.g. "run_ica algorithm \
+not specified; chose 'fastica'." Never let a scientific choice you made go unstated.
 - If the request cannot be expressed with these tools, return \
 {{"pipeline": [], "notes": ["<why>"]}}.
 
@@ -398,15 +402,41 @@ def _parse_config(raw: str) -> dict:
 
 
 def propose_pipeline(model: str, request: str, ctx_text: str | None = None,
-                     engine: str | None = None) -> dict:
-    """Ask the model to translate a request into a pipeline config. Runs nothing."""
-    resp = ollama.chat(
-        model=model,
-        messages=_planner_messages(PLANNER_PROMPT + _engine_directive(engine),
-                                   request, ctx_text),
-        format="json",  # ask Ollama to constrain output to valid JSON
-    )
-    return _parse_config(resp["message"].get("content") or "")
+                     engine: str | None = None, max_repairs: int = 2) -> dict:
+    """Ask the model to translate a request into a pipeline config. Runs nothing.
+
+    The JSON constraint guarantees syntax, not that an argument belongs to the selected tool or
+    has its required type. Validate each proposal and give a bounded correction turn when the
+    model emits a structurally invalid plan. This mirrors ``propose_sweep``: no model call occurs
+    after approval, and an exhausted repair still returns an invalid plan for the UI to reject.
+    """
+    messages = _planner_messages(PLANNER_PROMPT + _engine_directive(engine), request, ctx_text)
+    config, errors, attempts = {}, ["no attempt"], 0
+    for attempt in range(max_repairs + 1):
+        attempts = attempt + 1
+        resp = ollama.chat(model=model, messages=messages, format="json")
+        content = resp["message"].get("content") or ""
+        config = _parse_config(content)
+        errors = validate_pipeline(config)
+        if not errors:
+            if isinstance(config, dict):
+                config.setdefault("_planner_meta", {}).update(
+                    {"attempts": attempt + 1, "valid": True})
+            return config
+        # An empty plan is an intentional refusal, not a malformed proposal to pressure into a
+        # fabricated analysis. The caller keeps presenting its existing explanatory error.
+        if not isinstance(config, dict) or not config.get("pipeline"):
+            break
+        if attempt < max_repairs:
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": (
+                "That pipeline is invalid:\n- " + "\n- ".join(errors)
+                + "\nReturn a corrected pipeline JSON only, fixing exactly these problems and "
+                "changing nothing else.")})
+    if isinstance(config, dict):
+        config.setdefault("_planner_meta", {}).update(
+            {"attempts": attempts, "valid": False, "errors": errors})
+    return config
 
 
 def validate_pipeline(config: dict) -> list[str]:
