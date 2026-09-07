@@ -11,7 +11,8 @@ GPU directly, so Ollama stays on the host and the app connects to it).
 
 ## Prerequisites
 
-- **macOS on Apple Silicon** (M1/M2/M3+)
+- **macOS (Apple Silicon or Intel), Linux, or Windows (amd64).** On **Windows, use WSL2** (Ubuntu) and
+  run everything below inside it, so `make` and Docker behave like Linux.
 - **Docker Desktop** — https://docker.com (installed, and opened at least once so its engine runs)
 - **Ollama** — https://ollama.com (installed and running)
 - **~20 GB free disk** (the models) and **16 GB+ RAM** (the model is a 14B; less will swap and be slow)
@@ -19,12 +20,18 @@ GPU directly, so Ollama stays on the host and the app connects to it).
 ## Setup
 
 **Step 0 — let the app reach Ollama (do this once).** By default Ollama listens only on `127.0.0.1`,
-which a container can't reach, so this one step avoids the most common snag:
+which a container can't reach, so this one step avoids the most common snag. Pick your OS:
 
-```bash
-launchctl setenv OLLAMA_HOST 0.0.0.0:11434
-osascript -e 'quit app "Ollama"'; open -a Ollama
-```
+- **macOS:**
+  ```bash
+  launchctl setenv OLLAMA_HOST 0.0.0.0:11434
+  osascript -e 'quit app "Ollama"'; open -a Ollama
+  ```
+- **Linux:** run Ollama bound to all interfaces — `OLLAMA_HOST=0.0.0.0:11434 ollama serve` (or, if
+  Ollama runs under systemd, add `Environment="OLLAMA_HOST=0.0.0.0:11434"` via
+  `sudo systemctl edit ollama`, then `sudo systemctl restart ollama`).
+- **Windows (WSL2):** in PowerShell, `setx OLLAMA_HOST 0.0.0.0:11434`, then quit and reopen Ollama.
+  (`host.docker.internal` is automatic on Docker Desktop.)
 
 **Steps 1–5 — clone and run:**
 

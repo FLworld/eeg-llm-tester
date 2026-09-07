@@ -45,9 +45,10 @@ if [ -n "$tags" ] && command -v docker >/dev/null && docker info >/dev/null 2>&1
   else
     bad "Ollama is not reachable from inside a container (it's bound to 127.0.0.1).
        Make it listen on all interfaces, then restart it:
-         launchctl setenv OLLAMA_HOST 0.0.0.0:11434   # macOS Ollama app
-         osascript -e 'quit app \"Ollama\"'; open -a Ollama
-       (Linux: run  OLLAMA_HOST=0.0.0.0:11434 ollama serve )"
+         macOS:   launchctl setenv OLLAMA_HOST 0.0.0.0:11434
+                  osascript -e 'quit app \"Ollama\"'; open -a Ollama
+         Linux:   OLLAMA_HOST=0.0.0.0:11434 ollama serve
+         Windows: setx OLLAMA_HOST 0.0.0.0:11434   (then quit + reopen Ollama)"
   fi
 fi
 

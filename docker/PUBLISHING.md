@@ -13,9 +13,12 @@ Two ways to get the built image onto a tester's machine. Both assume the image b
 The **image contains only the app + frozen Python stack** — no models. Every tester still runs
 `make setup` once to pull the ~18 GB of models into their own Ollama. Nothing here changes that.
 
-**Scope for now: Apple-Silicon testers only** → the image is built **arm64-only** (`PLATFORMS` in the
-Makefile). No cross-arch emulation is needed. If you later ship to Intel Macs / Windows-WSL / Linux,
-add `linux/amd64` to `PLATFORMS` and rebuild (and make a separate amd64 tarball).
+**Both amd64 and arm64 are supported.** Testers build locally (`make build`), which produces an image
+for their own architecture, so Intel Macs / Linux / Windows-WSL (amd64) and Apple Silicon (arm64) are
+all covered with no per-arch work. The amd64 build has been validated under emulation. `PLATFORMS` in
+the Makefile is `linux/arm64` and only matters for **prebuilt** publishing: to push a prebuilt image to
+amd64 testers, set `PLATFORMS = linux/amd64,linux/arm64` for a multi-arch GHCR push, or `make save` a
+separate amd64 tarball (build it with `docker buildx build --platform linux/amd64 ... --load` first).
 
 **Use both methods** (this is the chosen plan): GHCR for testers comfortable with a one-time
 `docker login`, and a tarball for anyone else. The two are independent — publish once to each.
