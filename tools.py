@@ -332,7 +332,7 @@ def _event_inventory(filepath: str, raw) -> dict:
     if isinstance(filepath, str) and filepath.lower().endswith(".set"):
         native = _eeglab_native_events(filepath)
         if native is not None:
-            codes, _ = native
+            codes, _, _native_sfreq = native
             return dict(sorted(Counter(int(c) for c in codes).items()))
     try:
         events, event_id = mne.events_from_annotations(raw, verbose="ERROR")
@@ -1089,8 +1089,44 @@ def derive_bipolar_eog(heog: list | None = None, veog: list | None = None,
     auto_heog, auto_veog = _default_eog_pairs(raw.ch_names)
     heog_source = "user" if heog else "auto"
     veog_source = "user" if veog else "auto"
-    heog = heog or auto_heog
-    veog = veog or auto_veog
+
+    def _normalize_pair(user_val, auto_val, label):
+        """Ensure a pair is a 2-element [anode, cathode] list.
+
+        A bare string or 1-element list is treated as the anode; the cathode is taken from
+        the auto-detect result (same fallback the omitted-arg path uses). A 2-element list
+        passes through unchanged. If the single-anode path cannot find a cathode from
+        auto-detect, returns None so the caller reports the error.
+        """
+        if user_val is None:
+            return auto_val  # fully auto-detected (may be None if no standard pair found)
+        # Normalise: bare string -> 1-element list
+        if isinstance(user_val, str):
+            user_val = [user_val]
+        if len(user_val) == 2:
+            return user_val  # already a complete pair -- keep exactly as supplied
+        if len(user_val) == 1:
+            anode = user_val[0]
+            # Reuse the auto-detect cathode for this axis (same logic as omitted-arg path)
+            if auto_val and len(auto_val) == 2 and auto_val[0] == anode:
+                return auto_val  # auto-detect agrees on the anode -- take its cathode
+            # Auto-detect chose a different anode (or found nothing); try to find the
+            # cathode from the same auto-detect table by scanning for the anode explicitly
+            if label == "veog":
+                for a, c in [("VEOG_lower", "VEOG_upper"), ("VEOGL", "VEOGU"),
+                              ("VEOG_lower", "FP2")]:
+                    if a == anode and c in raw.ch_names:
+                        return [a, c]
+            elif label == "heog":
+                for a, c in [("HEOG_left", "HEOG_right"), ("HEOGL", "HEOGR"),
+                              ("LHEOG", "RHEOG")]:
+                    if a == anode and c in raw.ch_names:
+                        return [a, c]
+            return None  # cannot complete the pair
+        return None  # empty list -- caller will report
+
+    heog = _normalize_pair(heog, auto_heog, "heog")
+    veog = _normalize_pair(veog, auto_veog, "veog")
     if not heog or not veog:
         missing = [n for n, v in (("heog", heog), ("veog", veog)) if not v]
         return {"ok": False,
@@ -2548,7 +2584,8 @@ def _event_code_int(label):
 
 
 def _eeglab_native_events(filepath):
-    """Read (codes, sample0) straight from an EEGLAB .set's EEG.event struct, or None.
+    """Read (codes, sample0, native_sfreq) straight from an EEGLAB .set's EEG.event struct,
+    or None.
 
     Why this exists: after a downsample, EEGLAB/ERPLAB event latencies are *fractional*
     (e.g. 9581.75 at 256 Hz). MNE rounds them to integer samples on import; ERPLAB keeps the
@@ -2556,6 +2593,10 @@ def _eeglab_native_events(filepath):
     1-based). Those two rules disagree for any event with a .5/.75 fraction, shifting a subset
     of epochs by one sample. Using the native latencies with ERPLAB's floor reproduces the
     released epochs bit-exactly (r = 1.0); MNE's rounding does not.
+
+    Also returns EEG.srate (the .set's original sampling rate) so the caller can detect and
+    correct for a resample applied after load_eeg -- native latencies are in samples at the
+    .set's original rate, not at the current raw.info['sfreq'].
     """
     try:
         import scipy.io as sio
@@ -2563,7 +2604,8 @@ def _eeglab_native_events(filepath):
         ev = np.atleast_1d(EEG.event)
         lat = np.array([float(e.latency) for e in ev])
         codes = [_event_code_int(e.type) for e in ev]
-        return codes, np.floor(lat - 1.0).astype(int)
+        native_sfreq = float(EEG.srate)
+        return codes, np.floor(lat - 1.0).astype(int), native_sfreq
     except Exception:
         return None
 
@@ -2605,7 +2647,19 @@ def create_bins(bins=None, require_following_code: int | None = None,
                 "engine='erplab' needs the source EEGLAB .set to read native (fractional) event "
                 f"latencies, but they could not be read from {src!r}. Load the .set directly, or "
                 "use engine='mne'.")}
-        codes, samples = native
+        codes, samples, native_sfreq = native
+        # Rescale native latencies when the pipeline resampled after load_eeg. Native
+        # latencies are in samples at the .set's original rate; if current sfreq differs
+        # (e.g. 1024 -> 256 Hz, ratio 0.25) the samples must be multiplied by that ratio
+        # before they are used as indices into the resampled data. When no resample occurred
+        # (ratio == 1.0 exactly) this is a strict no-op so bit-exact results are preserved.
+        current_sfreq = float(raw.info["sfreq"])
+        ratio = current_sfreq / native_sfreq
+        if ratio != 1.0:
+            # Keep ERPLAB's floor convention: floor(latency - 1) was already applied to the
+            # fractional native samples; now scale those integer samples and re-floor to land
+            # on the nearest sample in the resampled grid.
+            samples = np.floor(samples * ratio).astype(int)
         latency_source = "eeglab_native_floor"
     else:
         events, event_dict = mne.events_from_annotations(raw)
