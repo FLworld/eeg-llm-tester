@@ -45,7 +45,7 @@ def app_modules():
 
 # Feature-conservation anchor: the shipped tool catalog must match the dev build exactly, so a
 # feature can never silently drop demo->final. Bump this when you intentionally add/remove a tool.
-EXPECTED_TOOL_COUNT = 33
+EXPECTED_TOOL_COUNT = 34
 
 
 def registry_parity():

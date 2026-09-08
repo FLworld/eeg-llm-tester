@@ -51,9 +51,14 @@ DATA_DIR = os.environ.get("EEG_DATA_DIR", "/data")
 def resolve_data_path(filepath: str) -> str:
     """Resolve a user-supplied recording path against DATA_DIR when needed.
 
-    An absolute or existing path passes through unchanged. Otherwise, if the name exists under
-    DATA_DIR, return that (lets a containerised user type `sub-002.set` for /data/sub-002.set).
-    If nothing matches, return the original string so the loader raises a clear FileNotFoundError
+    An absolute or existing path passes through unchanged. Otherwise, if the name exists directly
+    under DATA_DIR, return that (lets a containerised user type `sub-002.set` for
+    /data/sub-002.set). If that flat lookup fails (e.g. after BIDS auto-format, the file lives at
+    DATA_DIR/sub-002/eeg/sub-002_task-N170_eeg.set), fall back to a recursive search:
+      (a) exact basename match anywhere under DATA_DIR, then
+      (b) BIDS-pattern match: the sub-ID embedded in the filename (sub-XXX) combined with the
+          extension, i.e. sub-002/eeg/sub-002_*_eeg.set.
+    Returns the first match, or the original string so the loader raises a clear FileNotFoundError
     rather than a silent wrong-file load."""
     if not filepath or (os.path.isabs(filepath) and os.path.exists(filepath)):
         return filepath
@@ -62,6 +67,28 @@ def resolve_data_path(filepath: str) -> str:
     cand = os.path.join(DATA_DIR, filepath)
     if os.path.exists(cand):
         return cand
+
+    # Recursive fallback for files moved into BIDS layout by _handle_uploads.
+    if not os.path.isdir(DATA_DIR):
+        return filepath
+    basename = os.path.basename(filepath)
+    ext = os.path.splitext(basename)[1].lower()
+
+    # (a) exact basename match
+    for root, _dirs, files in os.walk(DATA_DIR):
+        if basename in files:
+            return os.path.join(root, basename)
+
+    # (b) BIDS pattern: sub-XXX stem + same extension -> sub-XXX/eeg/sub-XXX_*_eeg<ext>
+    sub_match = re.match(r"^(sub-[A-Za-z0-9]+)", basename, re.IGNORECASE)
+    if sub_match:
+        sub_id = sub_match.group(1).lower()
+        for root, _dirs, files in os.walk(DATA_DIR):
+            for f in files:
+                if (f.lower().startswith(sub_id) and f.lower().endswith("_eeg" + ext)
+                        and os.path.basename(root) == "eeg"):
+                    return os.path.join(root, f)
+
     return filepath
 
 
@@ -1068,6 +1095,175 @@ def inspect_ica_component(components) -> dict:
     }
 
 
+def _ica_eog_reference_traces(raw):
+    """Return (veog, heog, label) 1-D EOG traces for ICA-correlation.
+
+    Prefer bipolar '(uncorr) VEOG' / '(uncorr) HEOG' (single traces); else fall back to
+    VEOG_lower and (HEOG_left - HEOG_right). Ported from scripts/tune_ica.py.
+    """
+    names = raw.ch_names
+
+    def _get(name):
+        return raw.get_data(picks=[name])[0]
+
+    if "(uncorr) VEOG" in names and "(uncorr) HEOG" in names:
+        return _get("(uncorr) VEOG"), _get("(uncorr) HEOG"), "bipolar (uncorr) VEOG/HEOG"
+
+    veog = _get("VEOG_lower") if "VEOG_lower" in names else None
+    heog = None
+    if "HEOG_left" in names and "HEOG_right" in names:
+        heog = _get("HEOG_left") - _get("HEOG_right")
+    return veog, heog, "VEOG_lower / (HEOG_left - HEOG_right)"
+
+
+def _abs_pearson(a, b):
+    """Absolute Pearson r between two 1-D arrays. Returns NaN if either is constant."""
+    if a is None or b is None:
+        return float("nan")
+    a = np.asarray(a, float)
+    b = np.asarray(b, float)
+    if a.std() == 0 or b.std() == 0:
+        return float("nan")
+    return abs(float(np.corrcoef(a, b)[0, 1]))
+
+
+def _ica_eog_correlation_table(raw, ica):
+    """|Pearson r| of each ICA component vs the vertical & horizontal EOG.
+
+    Returns (rows, label) where each row is {'component' (1-based), 'r_veog', 'r_heog',
+    'r_max'}, sorted by r_max descending. Ported from scripts/tune_ica.py.
+    """
+    veog, heog, label = _ica_eog_reference_traces(raw)
+    sources = ica.get_sources(raw).get_data()  # (n_components, n_times)
+    rows = []
+    for i in range(sources.shape[0]):
+        s = sources[i]
+        r_v = _abs_pearson(s, veog)
+        r_h = _abs_pearson(s, heog)
+        r_max = np.nanmax([r_v if r_v == r_v else -1, r_h if r_h == r_h else -1])
+        rows.append({
+            "component": i + 1,
+            "r_veog": round(float(r_v), 4) if r_v == r_v else None,
+            "r_heog": round(float(r_h), 4) if r_h == r_h else None,
+            "r_max": round(float(r_max), 4) if r_max >= 0 else None,
+        })
+    rows.sort(key=lambda d: (d["r_max"] or -1), reverse=True)
+    return rows, label
+
+
+def review_ica() -> dict:
+    """Scan view for ICA triage: topography grid + EOG-correlation table + ICLabel labels.
+
+    Shows the full component line-up via ica.plot_components (topography grid) and returns
+    an EOG-correlation table (|Pearson r| of each component's time course vs VEOG/HEOG,
+    1-based, sorted by r_max descending) plus ICLabel labels where available. This is the
+    'frontal topography + high EOG correlation = eye artifact' triage the expert uses before
+    calling inspect_ica_component on candidates and then apply_ica(components=[...]).
+
+    Ported from scripts/tune_ica.py (eog_correlation_table / _eog_reference_traces /
+    _abs_pearson). Requires an ICA in the session (run_ica first). All component numbers are
+    1-based (matching run_ica / apply_ica).
+    """
+    ica = SESSION.get("ica")
+    if ica is None:
+        return {"ok": False, "error": "No ICA in session. Run run_ica first."}
+
+    _kind, raw = _active()
+    raw.load_data()
+    n = int(ica.n_components_)
+
+    # --- Topography grid ---
+    # Channels that are typed 'eeg' but lack scalp positions (NaN/zero loc, e.g. HEOG/VEOG
+    # imported as EEG) cause 'overlapping positions' errors in plot_components. Patch the ICA's
+    # own info with off-scalp dummy positions (unique x coords) so the topomap renderer skips
+    # them cleanly without error. The ICA's ch_names are a subset of raw.ch_names (fitted channels
+    # only), so only those in ica.info need to be patched.
+    _patched_chs = []
+    # Scan ica.info directly (not raw) — ica.info is an independent copy and retains
+    # original channel kinds even after set_channel_types is called on raw.  Any channel
+    # in ica.info with a NaN or all-zero position causes "overlapping positions" in
+    # plot_components; give it a unique off-scalp dummy x coord to suppress the error.
+    for _idx, _ch in enumerate(ica.info["chs"]):
+        _loc = _ch["loc"][:3]
+        if np.any(np.isnan(_loc)) or np.all(_loc == 0):
+            _ch["loc"][:3] = np.array([3.0 + _idx * 0.01, 0.0, 0.0])
+            _patched_chs.append(_ch["ch_name"])
+
+    try:
+        figs = ica.plot_components(show=False)
+        if not isinstance(figs, list):
+            figs = [figs]
+        # Tile multiple figures (mne may return >1 for large n_components)
+        arrs = []
+        for f in figs:
+            f.canvas.draw()
+            arrs.append(np.asarray(f.canvas.buffer_rgba()))
+            plt.close(f)
+        if len(arrs) > 1:
+            w = max(a.shape[1] for a in arrs)
+            tiled = np.vstack([np.pad(a, ((0, 0), (0, w - a.shape[1]), (0, 0)),
+                                       constant_values=255) for a in arrs])
+            fig2, ax = plt.subplots(figsize=(tiled.shape[1] / 100, tiled.shape[0] / 100), dpi=100)
+            ax.imshow(tiled)
+            ax.axis("off")
+            topo_b64 = _fig_to_b64(fig2)
+            plt.close(fig2)
+        else:
+            fig3, ax3 = plt.subplots(figsize=(arrs[0].shape[1] / 100, arrs[0].shape[0] / 100), dpi=100)
+            ax3.imshow(arrs[0])
+            ax3.axis("off")
+            topo_b64 = _fig_to_b64(fig3)
+            plt.close(fig3)
+    except Exception as exc:
+        return {"ok": False, "error": (
+            f"plot_components failed: {exc}. If channels lack scalp positions, type EOG/aux "
+            "channels via set_channel_types so topographies can render.")}
+
+    # --- EOG-correlation table ---
+    try:
+        eog_rows, eog_label = _ica_eog_correlation_table(raw, ica)
+        corr_ok = True
+    except Exception as exc:
+        eog_rows, eog_label = [], str(exc)
+        corr_ok = False
+
+    # --- ICLabel labels (best-effort; silently absent when ICLabel unavailable) ---
+    iclabel_labels: dict = {}
+    iclabel_error = None
+    try:
+        from mne_icalabel import label_components as _iclabel
+        raw_proc = raw.copy().filter(1.0, 100.0, picks="eeg", verbose="ERROR")
+        raw_proc.set_eeg_reference("average", verbose="ERROR")
+        res = _iclabel(raw_proc, ica, method="iclabel")
+        for i, lab in enumerate(res["labels"]):
+            iclabel_labels[i + 1] = str(lab)  # 1-based
+    except Exception as exc:
+        iclabel_error = str(exc)
+
+    # Annotate EOG rows with ICLabel label
+    for row in eog_rows:
+        row["iclabel"] = iclabel_labels.get(row["component"])
+
+    result = {
+        "ok": True,
+        "n_components": n,
+        "eog_trace_label": eog_label,
+        "eog_correlation_table": eog_rows,
+        "iclabel_available": bool(iclabel_labels),
+        "image": topo_b64,
+        "note": (
+            "REVIEW ONLY -- nothing removed. Read the topography grid + EOG table: "
+            "frontal topography + high r_max = eye artifact candidate. "
+            "Inspect candidates with inspect_ica_component, then apply_ica(components=[...])."
+        ),
+    }
+    if not corr_ok:
+        result["eog_correlation_error"] = eog_label
+    if iclabel_error:
+        result["iclabel_error"] = iclabel_error
+    return result
+
+
 _OCULAR_LABELS = {"eye", "eyes", "ocular", "blink", "blinks", "eog",
                   "eye movement", "eye movements"}
 
@@ -1471,12 +1667,58 @@ def compare_to_checkpoint(checkpoint: str, channels: list | None = None,
     return out
 
 
+def _erp_plot(evoked, plot_style: str, channels: list | None = None,
+              tmin: float | None = None, tmax: float | None = None) -> "plt.Figure":
+    """Render an ERP figure in one of two styles.
+
+    plot_style='butterfly'  -- all-channel overlay (MNE default, spatial_colors + GFP).
+    plot_style='channels'   -- only the named channel(s) as individual traces, with the
+                               analysis window (tmin..tmax) shaded via axvspan. Requires
+                               at least one channel name; falls back to butterfly if none.
+    """
+    style = (plot_style or "butterfly").lower()
+    if style == "channels" and channels:
+        # Filter to channels present in the evoked
+        picks = [c for c in channels if c in evoked.ch_names]
+        if not picks:
+            style = "butterfly"
+    if style != "channels":
+        return evoked.plot(spatial_colors=True, show=False, gfp=True)
+
+    # Channel-focused view: one line per channel, window shaded.
+    times_ms = evoked.times * 1000
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for ch in picks:
+        idx = evoked.ch_names.index(ch)
+        ax.plot(times_ms, evoked.data[idx] * 1e6, label=ch)
+    # Shade the analysis window if provided
+    if tmin is not None and tmax is not None:
+        ax.axvspan(tmin * 1000, tmax * 1000, alpha=0.18, color="steelblue",
+                   label=f"window {round(tmin*1000)}–{round(tmax*1000)} ms")
+    ax.axhline(0, color="k", linewidth=0.6, linestyle="--")
+    ax.axvline(0, color="k", linewidth=0.6, linestyle=":")
+    ax.set_xlabel("Time (ms)")
+    ax.set_ylabel("Amplitude (µV)")
+    ax.set_title("ERP — " + ", ".join(picks))
+    ax.legend(fontsize=8)
+    ax.invert_yaxis()
+    fig.tight_layout()
+    return fig
+
+
 def compute_erp(tmin: float | None = None, tmax: float | None = None,
-                event_id: str | None = None) -> dict:
+                event_id: str | None = None,
+                plot_style: str = "butterfly") -> dict:
     """Average epochs to an ERP, with a plot.
 
     If epoched data is already loaded (e.g. EEGLAB epoched .set/.mat), average it
     directly. Otherwise epoch around annotated events in the continuous recording.
+
+    plot_style='butterfly' (default) -- all-channel overlay (spatial_colors + GFP).
+    plot_style='channels'            -- named channel traces only, window shaded; for
+                                       compute_erp the GFP-peak channel is used
+                                       (no channel arg here; use compute_difference_erp
+                                       or measure_component for a specific channel view).
     """
     if SESSION.get("raw") is not None and (tmin is None or tmax is None):
         missing = [n for n, v in (("tmin", tmin), ("tmax", tmax)) if v is None]
@@ -1510,7 +1752,9 @@ def compute_erp(tmin: float | None = None, tmax: float | None = None,
     peak_idx = int(np.argmax(gfp))
     peak_latency_ms = round(float(evoked.times[peak_idx]) * 1000, 1)
 
-    fig = evoked.plot(spatial_colors=True, show=False, gfp=True)
+    # For 'channels' style in compute_erp, default to the GFP-peak channel
+    gfp_ch = evoked.ch_names[int(np.argmax(np.abs(evoked.data[:, peak_idx])))]
+    fig = _erp_plot(evoked, plot_style, channels=[gfp_ch], tmin=tmin, tmax=tmax)
 
     return {
         "ok": True,
@@ -1519,6 +1763,7 @@ def compute_erp(tmin: float | None = None, tmax: float | None = None,
         "tmax": tmax,
         "event_ids": use_id,
         "peak_gfp_latency_ms": peak_latency_ms,
+        "plot_style": (plot_style or "butterfly").lower(),
         "image": _fig_to_b64(fig),
     }
 
@@ -1551,7 +1796,9 @@ def _epochs_for_event(event_id, tmin: float, tmax: float):
 
 
 def compute_difference_erp(event_id_a, event_id_b,
-                           tmin: float | None = None, tmax: float | None = None) -> dict:
+                           tmin: float | None = None, tmax: float | None = None,
+                           channels: list | None = None,
+                           plot_style: str = "butterfly") -> dict:
     """Average two conditions separately and return the difference wave (A minus B).
 
     Needed for contrast-based ERP components (e.g. N170 = faces minus cars). Each
@@ -1559,6 +1806,12 @@ def compute_difference_erp(event_id_a, event_id_b,
     (e.g. faces = ['1',...,'40'], cars = ['41',...,'80']). Each condition is epoched
     and averaged on its own, then subtracted. The difference Evoked is stored for
     measure_component.
+
+    plot_style='butterfly' (default) -- all-channel overlay (spatial_colors + GFP).
+    plot_style='channels'            -- only the named channel(s) as traces with
+                                       tmin-tmax window shaded. `channels` defaults to the
+                                       GFP-peak channel when plot_style='channels' and none
+                                       are supplied.
     """
     if tmin is None or tmax is None:
         missing = [n for n, v in (("tmin", tmin), ("tmax", tmax)) if v is None]
@@ -1581,9 +1834,14 @@ def compute_difference_erp(event_id_a, event_id_b,
     SESSION["evoked"] = diff  # for measure_component
 
     gfp = diff.data.std(axis=0)
-    peak_latency_ms = round(float(diff.times[int(np.argmax(gfp))]) * 1000, 1)
+    peak_idx = int(np.argmax(gfp))
+    peak_latency_ms = round(float(diff.times[peak_idx]) * 1000, 1)
 
-    fig = diff.plot(spatial_colors=True, show=False, gfp=True)
+    # For 'channels' style: default to the GFP-peak channel if none specified
+    plot_chs = channels
+    if (plot_style or "butterfly").lower() == "channels" and not plot_chs:
+        plot_chs = [diff.ch_names[int(np.argmax(np.abs(diff.data[:, peak_idx])))]]
+    fig = _erp_plot(diff, plot_style, channels=plot_chs, tmin=tmin, tmax=tmax)
 
     return {
         "ok": True,
@@ -1594,13 +1852,15 @@ def compute_difference_erp(event_id_a, event_id_b,
         "tmin": tmin,
         "tmax": tmax,
         "peak_gfp_latency_ms": peak_latency_ms,
+        "plot_style": (plot_style or "butterfly").lower(),
         "image": _fig_to_b64(fig),
     }
 
 
 def measure_component(tmin: float, tmax: float, channels: list,
                       mode: str = "mean", engine: str = "mne",
-                      baseline: list | None = None) -> dict:
+                      baseline: list | None = None,
+                      plot_style: str = "channels") -> dict:
     """Score the most recent ERP / difference wave in a time window at given channels.
 
     mode='mean'  -> mean amplitude over the window (µV).
@@ -1619,6 +1879,10 @@ def measure_component(tmin: float, tmax: float, channels: list,
     convention, so ERP CORE's [-200, 0] INCLUDES t=0 -- note this is the opposite of the
     epoching baseline, which excludes it (see create_epochs). Not a no-op even on already
     baselined epochs: it shifts the ERP CORE N170 by 0.005 µV.
+
+    plot_style='channels' (default for measure_component) -- the named channel(s) as traces
+                           with the tmin-tmax window shaded (the legible view when measuring
+                           "the N170 at PO8"). Use 'butterfly' for the full all-channel overlay.
     """
     evoked = SESSION.get("evoked")
     if evoked is None:
@@ -1680,11 +1944,19 @@ def measure_component(tmin: float, tmax: float, channels: list,
         result["baseline_ms"] = list(baseline)
     if mode == "peak":
         # signed peak = most extreme deviation from 0 in the window
-        idx = int(np.argmax(np.abs(seg)))
-        result["amplitude_uv"] = round(float(seg[idx]) * 1e6, 4)
-        result["latency_ms"] = round(float(times[idx]) * 1000, 1)
+        pidx = int(np.argmax(np.abs(seg)))
+        result["amplitude_uv"] = round(float(seg[pidx]) * 1e6, 4)
+        result["latency_ms"] = round(float(times[pidx]) * 1000, 1)
     else:
         result["amplitude_uv"] = round(float(seg.mean()) * 1e6, 4)
+
+    # Plot: the named channel(s) with the window shaded (default for measure_component).
+    try:
+        fig = _erp_plot(evoked, plot_style, channels=channels, tmin=tmin, tmax=tmax)
+        result["image"] = _fig_to_b64(fig)
+        result["plot_style"] = (plot_style or "channels").lower()
+    except Exception:
+        pass  # plot is a convenience; never block the amplitude result
     return result
 
 
@@ -2949,6 +3221,7 @@ TOOL_FUNCTIONS = {
     "load_ica_eeglab": load_ica_eeglab,
     "apply_ica": apply_ica,
     "inspect_ica_component": inspect_ica_component,
+    "review_ica": review_ica,
     "derive_bipolar_eog": derive_bipolar_eog,
     "shift_events": shift_events,
     "delete_break_segments": delete_break_segments,
@@ -3593,6 +3866,25 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "review_ica",
+            "description": "Scan view for ICA triage: renders the full component topography grid "
+                           "(ica.plot_components) AND returns an EOG-correlation table (|Pearson r| "
+                           "of each component's source vs VEOG/HEOG, 1-based, sorted by r_max "
+                           "descending) plus ICLabel labels where available. Use this BEFORE "
+                           "inspect_ica_component to see the whole line-up and identify candidate "
+                           "ocular components (frontal topography + high r_max = eye artifact). "
+                           "REVIEW ONLY -- removes nothing; the expert then calls "
+                           "apply_ica(components=[...]). Requires an ICA in the session "
+                           "(run_ica first).",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "set_channel_types",
             "description": "Set channel types on the loaded recording, e.g. mark EOG/"
                            "auxiliary channels that were imported as EEG. Type a channel "
@@ -3652,6 +3944,11 @@ TOOL_SCHEMAS = [
                     "tmax": {"type": "number", "description": "Epoch end (s, relative to event)."},
                     "event_id": {"type": "string",
                                  "description": "Optional single annotation label to average."},
+                    "plot_style": {"type": "string",
+                                   "description": "'butterfly' (default, all-channel overlay with "
+                                                  "GFP) or 'channels' (GFP-peak channel only, "
+                                                  "window shaded). Use 'channels' when the user "
+                                                  "asks for a channel-focused or single-channel view."},
                 },
                 "required": ["tmin", "tmax"],
             },
@@ -3673,6 +3970,16 @@ TOOL_SCHEMAS = [
                                    "description": "Label or list of labels for condition B (subtrahend)."},
                     "tmin": {"type": "number", "description": "Epoch start (s, relative to event)."},
                     "tmax": {"type": "number", "description": "Epoch end (s, relative to event)."},
+                    "channels": {"type": "array", "items": {"type": "string"},
+                                 "description": "Channel(s) to show in 'channels' plot_style (e.g. "
+                                                "['PO8']). Defaults to the GFP-peak channel if "
+                                                "plot_style='channels' and this is omitted."},
+                    "plot_style": {"type": "string",
+                                   "description": "'butterfly' (default, all-channel overlay with "
+                                                  "GFP) or 'channels' (named channel(s) only, "
+                                                  "tmin-tmax window shaded). Use 'channels' for a "
+                                                  "legible single-channel view (e.g. 'show the N170 "
+                                                  "at PO8')."},
                 },
                 "required": ["event_id_a", "event_id_b", "tmin", "tmax"],
             },
@@ -3708,6 +4015,12 @@ TOOL_SCHEMAS = [
                                  "description": "Optional [start_ms, stop_ms] baseline re-applied "
                                                 "to the ERP before measuring, as ERPLAB's "
                                                 "'meanbl' measure does."},
+                    "plot_style": {"type": "string",
+                                   "description": "'channels' (default for measure_component -- the "
+                                                  "named channel(s) as traces with the tmin-tmax "
+                                                  "window shaded, the legible view when measuring "
+                                                  "'the N170 at PO8') or 'butterfly' (full all-channel "
+                                                  "overlay)."},
                 },
                 "required": ["tmin", "tmax", "channels"],
             },

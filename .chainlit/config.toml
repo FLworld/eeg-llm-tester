@@ -65,9 +65,11 @@ reaction_on_message_received = false
     #    accept = ["image/*", "audio/*", "video/*"]
     # 3. For specific file extensions:
     #    accept = { "application/octet-stream" = [".xyz", ".pdb"] }
-    # EEG recording formats + their sidecars (a .set needs .fdt; .vhdr needs .eeg/.vmrk).
-    # A concrete extension map avoids the "*/*" browser MIME warning.
-    accept = { "application/octet-stream" = [".set", ".fdt", ".edf", ".bdf", ".fif", ".vhdr", ".vmrk", ".eeg"] }
+    # Accept ALL files. EEG recordings (.set/.fdt/.edf/.bdf/.fif/.vhdr/.vmrk/.eeg) and BIDS sidecars
+    # (.json/.tsv) have browser MIME types that do NOT match a restrictive "application/octet-stream"
+    # map, so an extension map silently REJECTS real drops in the browser. Functional drag-drop beats
+    # silencing the cosmetic "*/*" dev-console MIME warning — keep this permissive.
+    accept = ["*/*"]
     max_files = 20
     max_size_mb = 500
 

@@ -283,8 +283,12 @@ async def _handle_plan(request: str):
     # runnable config displayed to or approved by the user.
     meta = config.pop("_planner_meta", {}) if isinstance(config, dict) else {}
     errors = validate_pipeline(config)
+    if meta.get("valid") is False:
+        errors.extend(e for e in (meta.get("errors") or ["Planner validation failed."])
+                      if e not in errors)
     if errors:
         cl.user_session.set("pending_pipeline", None)
+        cl.user_session.set("pending_sweep", None)
         await cl.Message(content=(
             "**Could not build a valid pipeline:**\n- " + "\n- ".join(errors)
             + "\n\nRefine the request and `/plan` again."
@@ -1245,13 +1249,100 @@ _RECORDING_EXTS = (".set", ".edf", ".fif", ".bdf", ".vhdr")
 # sidecars that must accompany a main recording (dragged together)
 _SIDECAR_EXTS = (".fdt", ".eeg", ".vmrk")
 
+import re as _re
+
+
+def _bids_format_recording(flat_path: str) -> tuple[str, str]:
+    """BIDS-format a newly-dropped recording into DATA_DIR.
+
+    Reads with _load_any (tolerant of EEGLAB .set/.fdt pairs), writes via mne-bids into
+    DATA_DIR/<sub-XXX>/eeg/<sub-XXX>_task-<task>_eeg.<ext> with EEGLAB format.
+
+    subject: parsed from filename sub-([A-Za-z0-9]+); else next free sub-NNN under DATA_DIR.
+    task: parsed from task-([A-Za-z0-9]+); else 'task' (label only, no scientific content).
+
+    Returns (bids_set_path, status_note) on success; raises on failure so the caller can STOP
+    and report rather than silently continue (fail-loud contract).
+    """
+    import mne_bids
+
+    from tools import _load_any
+
+    basename = os.path.basename(flat_path)
+
+    # --- subject: read from filename or assign next free ---
+    sub_m = _re.search(r"(?:^|[_\-])sub[-_]([A-Za-z0-9]+)", basename, _re.IGNORECASE)
+    if sub_m:
+        subject = sub_m.group(1)
+    else:
+        # next free sub-NNN: scan existing sub-* dirs under DATA_DIR
+        existing = set()
+        if os.path.isdir(DATA_DIR):
+            for d in os.listdir(DATA_DIR):
+                m = _re.match(r"sub-(\d+)$", d)
+                if m:
+                    existing.add(int(m.group(1)))
+        n = 1
+        while n in existing:
+            n += 1
+        subject = f"{n:03d}"
+
+    # --- task: read from filename or default 'task' ---
+    task_m = _re.search(r"task[-_]([A-Za-z0-9]+)", basename, _re.IGNORECASE)
+    task = task_m.group(1) if task_m else "task"
+    # 'task' default is intentional: it is a BIDS file-label only, not a scientific annotation.
+
+    kind, raw = _load_any(flat_path)
+    if kind != "raw":
+        raise RuntimeError(
+            f"BIDS auto-format expects a continuous recording; got {kind!r} from {basename}. "
+            "Drop epoched files without BIDS-format (use /scope <file> directly)."
+        )
+
+    # Strip montage/fiducials to avoid mne-bids 'head frame must contain nasion ...' error.
+    # The position information is NOT lost: it comes from channels.tsv / electrodes.tsv written
+    # by mne-bids from the file's original chanlocs, and reload re-applies standard_1005.
+    raw.set_montage(None, verbose="ERROR")
+
+    bids_path = mne_bids.BIDSPath(
+        subject=subject, task=task, datatype="eeg", root=DATA_DIR
+    )
+    mne_bids.write_raw_bids(
+        raw, bids_path, overwrite=True, allow_preload=True, format="EEGLAB", verbose=False
+    )
+
+    # Locate the written .set
+    eeg_dir = os.path.join(DATA_DIR, f"sub-{subject}", "eeg")
+    written = [f for f in os.listdir(eeg_dir) if f.endswith("_eeg.set")]
+    if not written:
+        raise RuntimeError(f"mne-bids wrote to {eeg_dir} but no _eeg.set found.")
+    bids_set = os.path.join(eeg_dir, written[0])
+
+    # Verify round-trip: load the written file back.
+    raw2 = mne.io.read_raw_eeglab(bids_set, preload=False, verbose="ERROR")
+    if len(raw2.ch_names) != len(raw.ch_names):
+        raise RuntimeError(
+            f"BIDS round-trip channel mismatch: written {len(raw.ch_names)}, "
+            f"reloaded {len(raw2.ch_names)}. Aborting BIDS format."
+        )
+
+    note = (f"sub-{subject}/eeg/{os.path.basename(bids_set)} "
+            f"(task={task!r}, {len(raw2.ch_names)} channels, round-trip OK)")
+    return bids_set, note
+
 
 async def _handle_uploads(msg: cl.Message) -> bool:
-    """Save dragged/uploaded files into DATA_DIR and auto-scope the primary recording.
+    """Save dragged/uploaded files into DATA_DIR, BIDS-format recordings, and auto-scope.
 
     Returns True if any files were handled. Multi-file formats (a .set needs its .fdt; a .vhdr
-    needs .eeg + .vmrk) work by dragging the whole group at once -- all are saved, the primary
-    recording is scoped. A lone sidecar (no main file) is reported, not silently ignored.
+    needs .eeg + .vmrk) work by dragging the whole group at once -- all are saved, then each
+    recording is BIDS-formatted into DATA_DIR/<sub-XXX>/eeg/. After formatting,
+    resolve_data_path can find the file by the original simple name (sub-002.set) via the BIDS
+    recursive fallback. A lone sidecar (no main file) is reported, not silently ignored.
+
+    Non-recording files (.json, .tsv, .codebook.json, etc.) are saved flat into DATA_DIR beside
+    any already-present recording -- the scope codebook chain (BIDS events.tsv, .codebook.json)
+    will find them there or under the eeg/ subfolder.
     """
     files = [(el.name, el.path) for el in (msg.elements or [])
              if getattr(el, "path", None) and getattr(el, "name", None)]
@@ -1268,20 +1359,56 @@ async def _handle_uploads(msg: cl.Message) -> bool:
             await cl.Message(content=f"**Upload failed** for `{name}`: {e}").send()
     if not saved:
         return True
+
     recordings = [n for n in saved if n.lower().endswith(_RECORDING_EXTS)]
+    sidecars_only = [n for n in saved if n.lower().endswith(_SIDECAR_EXTS)]
     listed = ", ".join(f"`{n}`" for n in saved)
+
     if not recordings:
-        await cl.Message(content=(
-            f"Received {listed} into `data-in/`, but that's a **sidecar** with no main recording. "
-            f"Drag the main file too (`.set` with its `.fdt`; `.vhdr` with `.eeg`+`.vmrk`), "
-            f"then I can scope it.")).send()
+        if sidecars_only:
+            await cl.Message(content=(
+                f"Received {listed} into `data-in/`, but that's a **sidecar** with no main "
+                f"recording. Drag the main file too (`.set` with its `.fdt`; `.vhdr` with "
+                f"`.eeg`+`.vmrk`), then I can scope it.")).send()
+        else:
+            # .json / .tsv / .codebook.json -- config files: ack and let the user scope
+            await cl.Message(content=(
+                f"Received {listed} into `data-in/`. "
+                f"Use `/scope <recording>` to load the recording these belong to; "
+                f"the codebook / events file will be picked up automatically."
+            )).send()
         return True
+
     primary = recordings[0]
     extra = ""
     if len(recordings) > 1:
-        extra = f" (scoping the first; others: {', '.join(recordings[1:])})"
-    await cl.Message(content=f"Saved {listed} into `data-in/`. Scoping `{primary}`{extra}…").send()
-    await _handle_scope(primary)
+        extra = f" (BIDS-formatting the first; others: {', '.join(recordings[1:])})"
+    await cl.Message(content=f"Received {listed}. BIDS-formatting `{primary}`{extra}…").send()
+
+    # BIDS auto-format: flat file -> sub-XXX/eeg/ layout with events.tsv + channels.tsv.
+    flat_path = os.path.join(DATA_DIR, primary)
+    try:
+        bids_set, note = await cl.make_async(_bids_format_recording)(flat_path)
+        await cl.Message(content=f"BIDS-formatted: `{note}`").send()
+        # Remove the flat copy now that BIDS layout is in place (avoids confusion on /scope).
+        try:
+            os.remove(flat_path)
+            fdt_flat = flat_path.replace(".set", ".fdt")
+            if os.path.exists(fdt_flat):
+                os.remove(fdt_flat)
+        except Exception:
+            pass
+        # Scope using the simple original name -- resolve_data_path's BIDS fallback finds it.
+        await _handle_scope(primary)
+    except Exception as exc:
+        # FAIL LOUD: report the BIDS failure, still scope the flat file as a fallback.
+        await cl.Message(content=(
+            f"**BIDS auto-format failed** for `{primary}`: {exc}\n\n"
+            f"The file is still in `data-in/` as a flat file and can be scoped by name. "
+            f"BIDS layout will not be available."
+        )).send()
+        await _handle_scope(primary)
+
     return True
 
 
