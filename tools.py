@@ -200,10 +200,33 @@ def _load_eeglab_struct(filepath: str):
         obj = mne.io.RawArray(data, info, verbose="ERROR")
         kind = "raw"
     try:
-        obj.set_montage("standard_1005", on_missing="ignore", verbose="ERROR")
+        # match_case=False so standard 10-20 names differing only in case (e.g. ERP CORE's FP1/FP2
+        # vs the montage's Fp1/Fp2) still receive positions; without it no channel is positioned and
+        # ICLabel/topomaps fail ("channel position is missing").
+        obj.set_montage("standard_1005", match_case=False, on_missing="ignore", verbose="ERROR")
     except Exception:
         pass
     return kind, obj
+
+
+def _apply_standard_montage_if_missing(obj) -> bool:
+    """Give scalp channels standard 10-20 positions ONLY when the file supplied none.
+
+    ICLabel/topomaps need a position for every scalp channel; many EEGLAB .set files (e.g. ERP
+    CORE) import with empty chanlocs. This fills them from standard_1005 by name (case-insensitive,
+    so FP1/FP2 match Fp1/Fp2). It never overrides real positions: if ANY channel already has one,
+    it is a no-op, so a dataset with genuine electrode coordinates is left untouched. This positions
+    channels from their standard names; it does NOT infer channel *types* (still the expert's call).
+    """
+    import numpy as _np
+    locs = _np.array([ch["loc"][:3] for ch in obj.info["chs"]])
+    if bool((_np.abs(_np.nan_to_num(locs)).sum(1) > 0).any()):
+        return False  # the file already carries positions -- do not override
+    try:
+        obj.set_montage("standard_1005", match_case=False, on_missing="ignore", verbose="ERROR")
+        return True
+    except Exception:
+        return False
 
 
 def _load_any(filepath: str):
@@ -223,7 +246,9 @@ def _load_any(filepath: str):
     if fp.endswith(".fif") or fp.endswith(".fif.gz"):
         return "raw", mne.io.read_raw_fif(filepath, preload=True)
     if fp.endswith(".set"):
-        return "raw", mne.io.read_raw_eeglab(filepath, preload=True)
+        raw = mne.io.read_raw_eeglab(filepath, preload=True)
+        _apply_standard_montage_if_missing(raw)
+        return "raw", raw
     if fp.endswith(".vhdr"):
         return "raw", mne.io.read_raw_brainvision(filepath, preload=True)
     return "raw", mne.io.read_raw(filepath, preload=True)
@@ -861,8 +886,10 @@ def run_ica(n_components: int = 15, algorithm: str | None = None, label_componen
         try:
             from mne_icalabel import label_components as iclabel
             res = iclabel(raw_proc, ica, method="iclabel")
+            # component numbers are 1-based (EEGLAB/ERP CORE convention) so they match what
+            # apply_ica(components=...) and inspect_ica_component(...) expect -- no 0-vs-1 trap.
             labels = [
-                {"component": i, "label": lab, "confidence": round(float(p), 3)}
+                {"component": i + 1, "label": lab, "confidence": round(float(p), 3)}
                 for i, (lab, p) in enumerate(zip(res["labels"], res["y_pred_proba"]))
             ]
         except Exception as exc:  # icalabel optional / model download issues
@@ -974,6 +1001,71 @@ def apply_ica(components: list | None = None, exclude: list | None = None,
     if resolve_info is not None:
         out["resolved_by_label"] = resolve_info
     return out
+
+
+def inspect_ica_component(components) -> dict:
+    """Show detailed properties of ICA component(s) so the EXPERT can decide which to remove.
+
+    Renders each component's topography, epochs image, ERP/time course, and power spectrum
+    (mne `plot_properties`) -- the detail needed to judge whether a component is ocular/muscle/
+    line-noise vs. brain. This is a REVIEW aid: it removes NOTHING. The expert inspects, then
+    calls apply_ica(components=[...]) with the ones they judge to be artifacts.
+
+    components : 1-based ICA component number(s) -- the SAME numbering as run_ica's labels and
+                 apply_ica (e.g. 1, or [1, 7]). Requires an ICA in the session (run_ica first).
+    """
+    ica = SESSION.get("ica")
+    if ica is None:
+        return {"ok": False, "error": "No ICA in session. Run run_ica first."}
+    if components is None:
+        return {"ok": False, "error": "inspect_ica_component needs `components` (1-based number(s))."}
+    if isinstance(components, (int, float, str)):
+        components = [components]
+    try:
+        picks0 = [int(c) - 1 for c in components]
+    except Exception:
+        return {"ok": False, "error": f"`components` must be 1-based integers; got {components!r}."}
+    n = int(ica.n_components_)
+    oor = [p + 1 for p in picks0 if p < 0 or p >= n]
+    if oor:
+        return {"ok": False, "error": f"Component(s) {oor} out of range 1..{n}."}
+    picks0 = picks0[:6]  # cap the rendered set so the image stays readable
+    _kind, obj = _active()
+    obj.load_data()
+    try:
+        figs = ica.plot_properties(obj, picks=picks0, show=False, verbose="ERROR")
+    except Exception as exc:
+        return {"ok": False, "error": (
+            f"plot_properties failed: {exc}. If fitted channels lack scalp positions, type "
+            "EOG/auxiliary channels via set_channel_types so topographies can render.")}
+    if not isinstance(figs, list):
+        figs = [figs]
+    # Stack the per-component property figures into one image; fall back to the first on any error.
+    try:
+        import numpy as _np
+        arrs = []
+        for f in figs:
+            f.canvas.draw()
+            arrs.append(_np.asarray(f.canvas.buffer_rgba()))
+            plt.close(f)
+        w = max(a.shape[1] for a in arrs)
+        stacked = _np.vstack([_np.pad(a, ((0, 0), (0, w - a.shape[1]), (0, 0)),
+                                      constant_values=255) for a in arrs])
+        fig2, ax = plt.subplots(figsize=(stacked.shape[1] / 100, stacked.shape[0] / 100), dpi=100)
+        ax.imshow(stacked); ax.axis("off")
+        image = _fig_to_b64(fig2); plt.close(fig2)
+    except Exception:
+        image = _fig_to_b64(figs[0])
+        for f in figs:
+            plt.close(f)
+    return {
+        "ok": True,
+        "components": [int(c) for c in components][:6],
+        "n_components": n,
+        "image": image,
+        "note": ("Review only -- nothing was removed. Decide which components are artifacts, "
+                 "then apply_ica(components=[...]) with those 1-based numbers."),
+    }
 
 
 _OCULAR_LABELS = {"eye", "eyes", "ocular", "blink", "blinks", "eog",
@@ -2856,6 +2948,7 @@ TOOL_FUNCTIONS = {
     "run_ica": run_ica,
     "load_ica_eeglab": load_ica_eeglab,
     "apply_ica": apply_ica,
+    "inspect_ica_component": inspect_ica_component,
     "derive_bipolar_eog": derive_bipolar_eog,
     "shift_events": shift_events,
     "delete_break_segments": delete_break_segments,
@@ -3473,6 +3566,27 @@ TOOL_SCHEMAS = [
                                              "instead of guessing indices after a fresh "
                                              "run_ica."},
                 },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_ica_component",
+            "description": "Show detailed properties (topography, epochs image, ERP/time course, "
+                           "power spectrum) of ICA component(s) so the EXPERT can decide which are "
+                           "artifacts. A REVIEW aid that removes nothing; after inspecting, the "
+                           "expert calls apply_ica(components=[...]). Requires an ICA in the "
+                           "session (run_ica first).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "components": {"type": "array", "items": {"type": "number"},
+                                   "description": "1-based ICA component number(s) to inspect "
+                                                  "(same numbering as run_ica's labels and "
+                                                  "apply_ica), e.g. [1] or [1,7]."},
+                },
+                "required": ["components"],
             },
         },
     },
