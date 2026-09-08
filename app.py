@@ -1332,6 +1332,42 @@ def _bids_format_recording(flat_path: str) -> tuple[str, str]:
     return bids_set, note
 
 
+async def _apply_dropped_codebook(saved: list) -> None:
+    """If a codebook was among the dropped files, apply it to the now-scoped recording.
+
+    A `<name>.codebook.json` (or any dropped `.json` carrying a "conditions" key) is applied via
+    set_codebook so it survives BIDS relocation and overrides the raw per-code events.tsv. No-op if
+    none was dropped or nothing is scoped.
+    """
+    cb_file = next((n for n in saved if n.lower().endswith(".codebook.json")), None)
+    if cb_file is None:
+        for n in saved:
+            if not n.lower().endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(DATA_DIR, n)) as fh:
+                    data = json.load(fh)
+                if isinstance(data, dict) and "conditions" in data:
+                    cb_file = n
+                    break
+            except Exception:
+                continue
+    if not cb_file:
+        return
+    try:
+        with open(os.path.join(DATA_DIR, cb_file)) as fh:
+            cb = json.load(fh)
+        res = set_codebook(conditions=cb.get("conditions"), responses=cb.get("responses"))
+    except Exception as e:
+        await cl.Message(content=f"⚠ Could not apply codebook `{cb_file}`: {e}").send()
+        return
+    if res.get("ok"):
+        conds = ", ".join((cb.get("conditions") or {}).keys())
+        await cl.Message(content=f"Applied codebook from `{cb_file}` (conditions: {conds}).").send()
+    else:
+        await cl.Message(content=f"⚠ Codebook `{cb_file}` not applied: {res.get('error')}").send()
+
+
 async def _handle_uploads(msg: cl.Message) -> bool:
     """Save dragged/uploaded files into DATA_DIR, BIDS-format recordings, and auto-scope.
 
@@ -1401,6 +1437,11 @@ async def _handle_uploads(msg: cl.Message) -> bool:
             pass
         # Scope using the simple original name -- resolve_data_path's BIDS fallback finds it.
         await _handle_scope(primary)
+        # A codebook dropped alongside would otherwise be ORPHANED by the BIDS relocation (it stays
+        # flat, no longer beside the recording), so scope would fall back to the raw per-code
+        # events.tsv. Apply it explicitly to the now-scoped recording (persists beside it; takes
+        # precedence over the raw BIDS codebook).
+        await _apply_dropped_codebook(saved)
     except Exception as exc:
         # FAIL LOUD: report the BIDS failure, still scope the flat file as a fallback.
         await cl.Message(content=(
