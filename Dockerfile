@@ -53,7 +53,7 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # --- RUNTIME ALLOWLIST: the ONLY app files that ship. Nothing else can enter the image. --- #
-COPY app.py pipeline.py tools.py prompt.py rag.py ingest.py exports.py \
+COPY app.py pipeline.py engines.py tools.py prompt.py rag.py ingest.py exports.py \
      batch.py qc.py recipes.py sweep.py \
      artifact_break_removal.py artifact_continuous_detect.py artifact_epoch_reject.py \
      Modelfile chainlit.md ./

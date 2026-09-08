@@ -37,6 +37,7 @@ from prompt import EEG_SYSTEM_PROMPT
 from rag import retrieve_context
 from batch import run_batch
 from exports import export_analysis
+from engines import (ENGINE_CHOICES, eeglab_ica_availability, engine_review, engine_runtime_errors)
 from qc import find_lab_rules, lint_config, load_lab_rules
 from recipes import list_recipes, load_recipe, rebind_to_current, save_recipe
 from sweep import expand_sweep, run_sweep, validate_sweep
@@ -130,7 +131,7 @@ async def start():
             "`/codebook {\"conditions\": {\"target\": [[1,40]], ...}}`.\n\n"
             "**Handy commands:** `/plan <pipeline>` · `/sweep <param sweep>` · "
             "`/batch <dataset-dir>` (whole cohort) · `/params <tool>` (what a tool takes) · "
-            "`/engine mne|erplab` · `/export <name>` (analysis deliverable) · "
+            "`/engine mne|eeglab` · `/export <name>` (analysis deliverable) · "
             "`/save-plan <name>` & `/recipes` (reuse). "
             "Or just chat: *\"load my-recording.set and compute its band power.\"*"
         )
@@ -282,7 +283,7 @@ async def _handle_plan(request: str):
     # Planner telemetry is useful for the review heading, but must never become part of the
     # runnable config displayed to or approved by the user.
     meta = config.pop("_planner_meta", {}) if isinstance(config, dict) else {}
-    errors = validate_pipeline(config)
+    errors = validate_pipeline(config) + engine_runtime_errors(config)
     if meta.get("valid") is False:
         errors.extend(e for e in (meta.get("errors") or ["Planner validation failed."])
                       if e not in errors)
@@ -303,7 +304,8 @@ async def _handle_plan(request: str):
     await cl.Message(content=(
         f"**Proposed pipeline** ({source}{repaired}). Review it, then `/run` to execute "
         "*exactly this* (no model in the loop), or `/cancel`:\n"
-        f"```json\n{format_config(config)}\n```{note_md}{_qc_block(config)}"
+        f"```json\n{format_config(config)}\n```"
+        f"{engine_review(config, cl.user_session.get('engine'))}{note_md}{_qc_block(config)}"
     )).send()
 
 
@@ -741,40 +743,42 @@ def _detect_params_query(text: str) -> str | None:
     return "ASK" if strong else None   # weak/verb wording without a tool -> normal chat
 
 
-ENGINE_CHOICES = {"mne", "erplab", "eeglab", "eeglab-python"}
-
-
 async def _handle_engine(arg: str):
-    """Set (or show/clear) the session toolbox-convention default for the planner.
-
-    `/engine erplab` -> the planner passes engine='erplab' on engine-capable tools unless a
-    request names a different toolbox for a step. `/engine` shows current; `/engine none`
-    clears it. Explicit and reviewable; never auto-detected (per _core/CONVENTIONS.md).
-    """
+    """Set a session default, with explicit natural-language per-step overrides."""
     val = arg.strip().lower()
-    if not val:
-        cur = cl.user_session.get("engine")
-        await cl.Message(content=(
-            f"Session engine default: **{cur or 'none'}** (tools fall back to their own "
-            "default, `mne`). Set with `/engine mne` or `/engine erplab`; clear with "
-            "`/engine none`."
-        )).send()
-        return
     if val in ("none", "clear", "off"):
         cl.user_session.set("engine", None)
-        await cl.Message(content="Cleared the session engine default.").send()
-        return
-    if val not in ENGINE_CHOICES:
+        val = ""
+    elif val and val not in ENGINE_CHOICES:
         await cl.Message(content=(
-            f"Unknown engine '{val}'. Choose one of: {', '.join(sorted(ENGINE_CHOICES))}."
+            f"Unknown session engine '{val}'. Choose `/engine mne` or `/engine eeglab`. "
+            "`erplab` is the ERP backend within the EEGLAB profile; `eeglab-python` is an "
+            "advanced ICA backend that can be requested for that step in natural language. "
+            "The session default has not changed."
         )).send()
         return
-    cl.user_session.set("engine", val)
-    await cl.Message(content=(
-        f"Session engine default set to **{val}**. New `/plan` and `/sweep` drafts will use "
-        f"engine='{val}' on engine-capable tools unless a request names a different toolbox. "
-        "You can still override per step."
-    )).send()
+    elif val:
+        cl.user_session.set("engine", val)
+    current = cl.user_session.get("engine")
+    label = current.upper() if current in ENGINE_CHOICES else "not set (tool defaults: MNE)"
+    lines = [f"**Session engine default: {label}**"]
+    if current == "eeglab":
+        lines.append("ICA: **EEGLAB** (`eeglab`, genuine runica via Octave). "
+                     "Filtering, binning, epoching and component measurement: **ERPLAB** (`erplab`).")
+        missing = eeglab_ica_availability()
+        if missing:
+            lines.append(f"EEGLAB ICA is unavailable in this runtime (missing: {', '.join(missing)}). "
+                         "It will not fall back to MNE.")
+    else:
+        lines.append("Engine-capable tools use **MNE** (`mne`) unless explicitly overridden.")
+    lines.append("Applies to new natural-language `/plan` and `/sweep` requests. "
+                 "A step-specific instruction such as 'use MNE for ICA' overrides it for that "
+                 "request without changing the session default. Pasted JSON and saved recipes retain their engines.")
+    lines.append("`/engine` shows the default; `/engine none` clears it. "
+                 "Tools without an engine option keep their existing implementation.")
+    if cl.user_session.get("pending_pipeline") or cl.user_session.get("pending_sweep"):
+        lines.append("The already staged plan is unchanged; draft a new plan to use the new default.")
+    await cl.Message(content="\n\n".join(lines)).send()
 
 
 def _try_parse_sweep(text: str) -> dict | None:
@@ -977,9 +981,12 @@ async def _handle_sweep(request: str):
         )).send()
         return
 
-    errors = validate_sweep(spec)
+    errors = validate_sweep(spec) + engine_runtime_errors(spec)
+    if meta.get("valid") is False:
+        errors.extend(e for e in (meta.get("errors") or ["Planner validation failed."]) if e not in errors)
     if errors:
         cl.user_session.set("pending_sweep", None)
+        cl.user_session.set("pending_pipeline", None)
         tried = f" (after {meta['attempts']} attempts)" if meta.get("attempts", 1) > 1 else ""
         await cl.Message(content=(
             f"**Could not build a valid sweep{tried}:**\n- " + "\n- ".join(errors)
@@ -998,7 +1005,8 @@ async def _handle_sweep(request: str):
     await cl.Message(content=(
         f"**Proposed sweep** ({source}{repaired}) — **{len(variants)} variants**. Review, then "
         "`/run` to execute *exactly this* (no model in the loop), or `/cancel`:\n"
-        f"```json\n{format_config(spec)}\n```\n**Variants:**\n{grid}{note_md}{_qc_block(spec)}"
+        f"```json\n{format_config(spec)}\n```"
+        f"{engine_review(spec, cl.user_session.get('engine'))}\n**Variants:**\n{grid}{note_md}{_qc_block(spec)}"
     )).send()
 
 

@@ -22,6 +22,8 @@ import re
 import ollama
 
 from tools import TOOL_FUNCTIONS, TOOL_SCHEMAS
+from engines import (apply_engine_defaults, engine_request,
+                     validate_engine_values)
 
 # Allowed parameter names (and their JSON-schema types) per tool, derived from the
 # Ollama schemas so this stays in sync with tools.py automatically.
@@ -59,6 +61,10 @@ def _tool_catalog() -> str:
         required = set(f["parameters"].get("required", []))
         sig = ", ".join(f"{k}*" if k in required else k for k in props)
         lines.append(f"- {f['name']}({sig}): {f['description']}")
+        if f["name"] == "run_ica":
+            algorithm = props["algorithm"]
+            lines.append(f"  algorithm: {algorithm['description']} "
+                         f"Allowed values: {', '.join(algorithm['enum'])}.")
     return "\n".join(lines)
 
 
@@ -123,6 +129,11 @@ Rules -- follow them exactly; they are what make the plan trustworthy:
 - Include ONLY the steps the user asked for. Do NOT add preprocessing (filtering, \
 referencing, artifact removal, epoching) that the user did not request.
 - For any parameter the user specified, use that EXACT value.
+- ICA: extended Infomax is NOT ordinary Infomax. Preserve the explicit algorithm: \
+"extended infomax", "extended-infomax", "extended_infomax", "extendedinfomax", and \
+"ext infomax" mean algorithm="extended-infomax"; ordinary Infomax means "infomax". \
+Picard means "picard" and FastICA means "fastica". Never claim an explicitly requested \
+algorithm was unspecified, defaulted, or guessed in notes.
 - For any parameter the user did NOT specify, OMIT the key entirely so the tool's own \
 default applies. Do NOT guess a value, and do NOT include a key set to null, false, or an \
 empty list to signal "unused" -- leave it out.
@@ -210,21 +221,22 @@ overrides it.
 """
 
 
-def _engine_directive(engine: str | None) -> str:
+def _engine_directive(engine: str | None, request: str = "") -> str:
     """A session-level toolbox-convention directive appended to the planner system prompt.
 
     The human sets it once (`/engine`); it is explicit and reviewable, never auto-detected.
     Tells the model which `engine` to pass on engine-capable tools when the request itself
     does not name a toolbox -- so the per-call override still wins.
     """
-    if not engine:
-        return ""
-    return (
-        f"\n\nSESSION ENGINE DEFAULT: '{engine}'. For every tool that accepts an `engine` "
-        f"parameter (filter_eeg, resample, create_bins, create_epochs, measure_component, "
-        f"run_ica, ...), set engine='{engine}' UNLESS the request explicitly names a different "
-        f"toolbox for that step. This is the user's chosen convention for the session."
-    )
+    resolved, _ = engine_request(request, engine)
+    lines = ["\n\nToolbox choices are tool-specific. MNE uses engine='mne'. "
+             "EEGLAB uses engine='eeglab' for ICA and engine='erplab' for filtering, "
+             "binning, epoching and component measurement. Never add engine to resample "
+             "or another tool that does not accept it. Explicit request overrides win "
+             "over the session default; never infer an override from reference context."]
+    lines.extend(f"{tool}: engine='{value}' ({source})."
+                 for tool, (value, source) in resolved.items())
+    return "\n".join(lines)
 
 
 def _planner_messages(system: str, request: str, ctx_text: str | None) -> list[dict]:
@@ -353,7 +365,11 @@ def propose_sweep(model: str, request: str, ctx_text: str | None = None,
     from sweep import validate_sweep  # lazy: sweep imports pipeline (avoid import cycle)
 
     schema = _sweep_schema()
-    messages = _planner_messages(PLANNER_SWEEP_PROMPT + _engine_directive(engine),
+    resolved, selection_errors = engine_request(request, engine)
+    if selection_errors:
+        return {"base_pipeline": [], "axes": [], "notes": selection_errors,
+                "_planner_meta": {"attempts": 0, "valid": False, "errors": selection_errors}}
+    messages = _planner_messages(PLANNER_SWEEP_PROMPT + _engine_directive(engine, request),
                                  request, ctx_text)
     spec, errors = {}, ["no attempt"]
     for attempt in range(max_repairs + 1):
@@ -369,7 +385,7 @@ def propose_sweep(model: str, request: str, ctx_text: str | None = None,
                 {"attempts": attempt + 1, "valid": True, "declined": True})
             return spec
         _sanitize_sweep(spec)  # drop bogus arg KEYS before validating (deterministic, noted)
-        errors = validate_sweep(spec)
+        errors = apply_engine_defaults(spec, resolved) + validate_sweep(spec)
         if not errors:
             spec.setdefault("_planner_meta", {})["attempts"] = attempt + 1
             spec["_planner_meta"]["valid"] = True
@@ -401,6 +417,77 @@ def _parse_config(raw: str) -> dict:
     return {"pipeline": [], "notes": ["Planner did not return valid JSON."]}
 
 
+_ICA_NAME = re.compile(
+    r"(?<![\w/])(?:extended[\s_-]*infomax|ext[\s_-]+infomax|infomax|picard|fastica)(?![\w/])",
+    re.IGNORECASE,
+)
+
+
+def _ica_algorithm_name(value: str) -> str:
+    compact = re.sub(r"[\s_-]+", "", value.lower())
+    return "extended-infomax" if compact in ("extendedinfomax", "extinfomax") else compact
+
+
+def requested_ica_algorithm(request: str) -> tuple[str | None, list[str]]:
+    """Recognize explicit algorithm names, declining ambiguous/negated selections.
+
+    Only the user's request is inspected, never retrieved context or generated notes.
+    This is a narrow guard, not a general natural-language parser.
+    """
+    matches = list(_ICA_NAME.finditer(request))
+    if not matches:
+        return None, []
+    names = {_ica_algorithm_name(m.group()) for m in matches}
+    negated = False
+    for match in matches:
+        clause = re.split(r"[.,;!?\n]", request[:match.start()])[-1]
+        if re.search(r"\b(?:not|never|without|avoid|exclude|don['’]t|rather than|instead of)\b",
+                     clause, re.IGNORECASE):
+            negated = True
+    if len(names) != 1 or negated:
+        return None, ["ICA algorithm selection is ambiguous or negated. "
+                      "Please state one algorithm to fit explicitly."]
+    return names.pop(), []
+
+
+def validate_ica_request(config: dict, algorithm: str | None) -> list[str]:
+    """Check a single explicit ICA choice against the draft, including provenance notes."""
+    if algorithm is None or not isinstance(config, dict):
+        return []
+    steps = config.get("pipeline")
+    if not isinstance(steps, list):
+        return []  # structural validation supplies this error
+    fits = [step for step in steps if isinstance(step, dict) and step.get("tool") == "run_ica"]
+    errors = []
+    if len(fits) != 1:
+        errors.append(f"Request explicitly selects ICA algorithm '{algorithm}'; "
+                      f"expected exactly one run_ica step, got {len(fits)}.")
+    else:
+        args = fits[0].get("args")
+        actual = args.get("algorithm") if isinstance(args, dict) else None
+        if not isinstance(actual, str) or _ica_algorithm_name(actual) != algorithm:
+            errors.append(f"Request explicitly selects ICA algorithm '{algorithm}', "
+                          f"but run_ica.algorithm is {actual!r}. Preserve the requested algorithm.")
+    notes = config.get("notes") or []
+    if isinstance(notes, str):
+        notes = [notes]
+    if isinstance(notes, list):
+        for note in notes:
+            if not isinstance(note, str):
+                continue
+            named = {_ica_algorithm_name(m.group()) for m in _ICA_NAME.finditer(note)}
+            relevant = named or re.search(r"\b(?:algorithm|run_ica)\b", note, re.IGNORECASE)
+            omission = re.search(r"\b(?:unspecified|not\s+(?:explicitly\s+)?(?:specified|provided|given|stated|named)|"
+                                 r"(?:wasn['’]t|isn['’]t|hasn['’]t been)\s+(?:explicitly\s+)?(?:specified|provided|given|stated)|"
+                                 r"no\s+(?:explicit\s+)?algorithm|did\s+not\s+(?:specify|provide|state)|"
+                                 r"default(?:ed)?|guess(?:ed)?|assum(?:ed|ing))\b",
+                                 note, re.IGNORECASE)
+            if relevant and (omission or named - {algorithm}):
+                errors.append(f"ICA note contradicts the explicit '{algorithm}' request: {note!r}. "
+                              "Remove the false assumption; the user supplied the algorithm.")
+    return errors
+
+
 def propose_pipeline(model: str, request: str, ctx_text: str | None = None,
                      engine: str | None = None, max_repairs: int = 2) -> dict:
     """Ask the model to translate a request into a pipeline config. Runs nothing.
@@ -410,14 +497,21 @@ def propose_pipeline(model: str, request: str, ctx_text: str | None = None,
     model emits a structurally invalid plan. This mirrors ``propose_sweep``: no model call occurs
     after approval, and an exhausted repair still returns an invalid plan for the UI to reject.
     """
-    messages = _planner_messages(PLANNER_PROMPT + _engine_directive(engine), request, ctx_text)
+    algorithm, selection_errors = requested_ica_algorithm(request)
+    resolved, engine_errors = engine_request(request, engine)
+    selection_errors += engine_errors
+    if selection_errors:
+        return {"pipeline": [], "notes": selection_errors,
+                "_planner_meta": {"attempts": 0, "valid": False, "errors": selection_errors}}
+    messages = _planner_messages(PLANNER_PROMPT + _engine_directive(engine, request), request, ctx_text)
     config, errors, attempts = {}, ["no attempt"], 0
     for attempt in range(max_repairs + 1):
         attempts = attempt + 1
         resp = ollama.chat(model=model, messages=messages, format="json")
         content = resp["message"].get("content") or ""
         config = _parse_config(content)
-        errors = validate_pipeline(config)
+        errors = (apply_engine_defaults(config, resolved) + validate_pipeline(config)
+                  + validate_ica_request(config, algorithm))
         if not errors:
             if isinstance(config, dict):
                 config.setdefault("_planner_meta", {}).update(
@@ -498,7 +592,7 @@ def validate_pipeline(config: dict) -> list[str]:
                     f"Step {i} ({name}): arg '{key}' should be {expected}, "
                     f"got {type(value).__name__}."
                 )
-    return errors
+    return errors + validate_engine_values(config)
 
 
 async def run_pipeline(config: dict, run_step) -> tuple[list[dict], list[tuple[str, str]]]:
