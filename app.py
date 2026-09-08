@@ -1318,8 +1318,9 @@ def _bids_format_recording(flat_path: str) -> tuple[str, str]:
         raise RuntimeError(f"mne-bids wrote to {eeg_dir} but no _eeg.set found.")
     bids_set = os.path.join(eeg_dir, written[0])
 
-    # Verify round-trip: load the written file back.
-    raw2 = mne.io.read_raw_eeglab(bids_set, preload=False, verbose="ERROR")
+    # Verify round-trip: load the written file back (via _load_any, already imported; app.py does
+    # not import mne, and _load_any tolerantly handles the .set/.fdt pair).
+    _kind2, raw2 = _load_any(bids_set)
     if len(raw2.ch_names) != len(raw.ch_names):
         raise RuntimeError(
             f"BIDS round-trip channel mismatch: written {len(raw.ch_names)}, "
