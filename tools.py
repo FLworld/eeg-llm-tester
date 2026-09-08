@@ -1030,6 +1030,24 @@ def apply_ica(components: list | None = None, exclude: list | None = None,
     return out
 
 
+def _patch_ica_positionless(ica) -> list:
+    """Give NaN/zero-position channels in ica.info a unique off-scalp dummy coord.
+
+    Non-scalp channels typed 'eeg' (e.g. HEOG/VEOG imported as EEG) have NaN or all-zero loc,
+    which mne's topomap reads as OVERLAPPING positions and refuses to plot -- breaking
+    plot_properties / plot_components entirely. Scan ica.info directly (it is an independent copy
+    and keeps original channel kinds even after set_channel_types on raw); assign each offender a
+    unique x well off the scalp so the renderer skips it cleanly. Returns the patched names.
+    """
+    patched = []
+    for i, ch in enumerate(ica.info["chs"]):
+        loc = ch["loc"][:3]
+        if np.any(np.isnan(loc)) or np.all(loc == 0):
+            ch["loc"][:3] = np.array([3.0 + i * 0.01, 0.0, 0.0])
+            patched.append(ch["ch_name"])
+    return patched
+
+
 def inspect_ica_component(components) -> dict:
     """Show detailed properties of ICA component(s) so the EXPERT can decide which to remove.
 
@@ -1059,6 +1077,11 @@ def inspect_ica_component(components) -> dict:
     picks0 = picks0[:6]  # cap the rendered set so the image stays readable
     _kind, obj = _active()
     obj.load_data()
+    # Non-scalp channels typed 'eeg' (e.g. HEOG/VEOG imported as EEG) have NaN/zero, hence
+    # OVERLAPPING, positions -> mne's topomap raises "overlapping positions" and the whole render
+    # fails, so a bare run_ica -> inspect returns blank. Give each such channel a unique off-scalp
+    # dummy position (same patch review_ica uses) so the renderer skips them cleanly.
+    _patch_ica_positionless(ica)
     try:
         figs = ica.plot_properties(obj, picks=picks0, show=False, verbose="ERROR")
     except Exception as exc:
