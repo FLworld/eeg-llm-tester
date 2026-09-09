@@ -39,9 +39,10 @@ from rag import retrieve_context
 from batch import run_batch
 from exports import export_analysis
 from engines import (ENGINE_CHOICES, eeglab_ica_availability, engine_review, engine_runtime_errors)
-from qc import find_lab_rules, lint_config, load_lab_rules
+from qc import (LAB_RULE_KEYS, discover_lab_rules, find_lab_rules, lint_config,
+                load_lab_rules, looks_like_lab_rules)
 from recipes import list_recipes, load_recipe, rebind_to_current, save_recipe
-from sweep import expand_sweep, run_sweep, validate_sweep
+from sweep import expand_sweep, format_sweep_table, run_sweep, validate_sweep
 from tools import (
     DATA_DIR,
     SCOPE,
@@ -62,8 +63,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 # sessions/recipes/batches persist across container restarts.
 STATE_DIR = os.environ.get("STATE_DIR", _HERE)
 SESSIONS_DIR = os.path.join(STATE_DIR, "sessions")
-# Lab conventions supervised by the QC linter (a lab-wide lab_rules.json/yaml, auto-loaded if present).
-LAB_RULES, LAB_RULES_PATH = find_lab_rules(_HERE)
+# Lab conventions supervised by the QC linter. Auto-load a lab_rules.(json|yaml) from the mounted
+# data-in (DATA_DIR) first, then the persistent STATE_DIR, then a baked default beside app.py.
+LAB_RULES, LAB_RULES_PATH = find_lab_rules(DATA_DIR, STATE_DIR, _HERE)
 
 # Optional password gate for a shared machine. Unset APP_PASSWORD => no auth (the default;
 # the app is bound to loopback anyway). When set, any username + this password logs in.
@@ -549,31 +551,84 @@ async def _handle_codebook(arg: str):
     await cl.Message(content=msg + "\n\n```\n" + scope_context() + "\n```").send()
 
 
+_LAB_RULES_KEYS_HELP = (
+    "Supported keys: `require_steps` (steps that must appear), `forbid_steps` (not allowed), "
+    "`order` (required relative order), `require_before` ({A: B} — A before B), "
+    "`param_equals` ({tool: {param: value}}). All are deterministic, non-blocking review-card "
+    "warnings on every `/plan` and `/sweep`, on top of the built-in universal traps "
+    "(filter-after-epoch, reref-after-ICA, absent channels/codes)."
+)
+
+
+def _resolve_lab_rules_path(arg: str) -> str | None:
+    """Resolve a lab-rules argument to a file: an explicit path, else a bare name looked up in
+    data-in (DATA_DIR) then STATE_DIR. Lets a user assign an arbitrarily-named file."""
+    if os.path.exists(arg):
+        return arg
+    for base in (DATA_DIR, STATE_DIR):
+        cand = os.path.join(base, arg)
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
 async def _handle_lab_rules(arg: str):
-    """Show or load the lab conventions the QC linter enforces. `/lab-rules` shows the active
-    set; `/lab-rules <path>` loads a lab_rules.(json|yaml). These are supervised deterministically
-    and surfaced as review-card warnings on every /plan and /sweep (non-blocking)."""
+    """Show, assign, or clear the lab conventions the QC linter enforces.
+
+    `/lab-rules`                  show the active rules + supported keys + other conventions found
+    `/lab-rules <path-or-name>`   assign ANY JSON/YAML file (arbitrary name) as the active rules;
+                                  a bare name is resolved against data-in then STATE_DIR
+    `/lab-rules off`              deactivate lab rules (built-in traps still run)
+    """
     global LAB_RULES, LAB_RULES_PATH
-    path = arg.strip()
-    if path:
+    arg = arg.strip()
+
+    if arg.lower() in ("off", "none", "clear", "disable"):
+        LAB_RULES, LAB_RULES_PATH = None, None
+        await cl.Message(content="Lab rules cleared. The built-in universal traps still run on "
+                                 "every plan/sweep.").send()
+        return
+
+    if arg:  # assign a specific file (arbitrary name), resolving bare names against data-in
+        path = _resolve_lab_rules_path(arg)
+        if path is None:
+            await cl.Message(content=(
+                f"Could not find `{arg}`. Give a path, or a filename present in `data-in/`. "
+                f"Drop your rules file there (any name), then `/lab-rules <name>`.")).send()
+            return
         rules = await cl.make_async(load_lab_rules)(path)
         if rules is None:
-            await cl.Message(content=f"Could not load lab rules from `{path}` "
-                             "(expected a JSON/YAML file).").send()
+            await cl.Message(content=f"Could not parse `{path}` (expected JSON/YAML).").send()
+            return
+        if not looks_like_lab_rules(rules):
+            await cl.Message(content=(
+                f"`{os.path.basename(path)}` has none of the lab-rule keys, so it isn't a rules "
+                f"file. {_LAB_RULES_KEYS_HELP}")).send()
             return
         LAB_RULES, LAB_RULES_PATH = rules, path
+
+    # Discover other convention files the user could switch to (any name, in data-in/STATE_DIR).
+    discovered = await cl.make_async(discover_lab_rules)(DATA_DIR, STATE_DIR, _HERE)
+    others = [p for p, _ in discovered if p != LAB_RULES_PATH]
+
     if not LAB_RULES:
-        await cl.Message(content=(
-            "No lab rules active. Drop a `lab_rules.json` (or `.yaml`) next to `app.py`, or "
-            "`/lab-rules /path/to/lab_rules.yaml`. Supported keys: `require_steps`, `forbid_steps`, "
-            "`order`, `require_before`, `param_equals`. The QC linter always also checks the "
-            "built-in universal traps (filter-after-epoch, reref-after-ICA, absent channels/codes)."
-        )).send()
+        lines = ["No lab rules active — only the built-in universal traps run.", "",
+                 "Assign one with `/lab-rules <path-or-name>` (drop a JSON/YAML file with any name "
+                 "into `data-in/`, then `/lab-rules <name>`).", "", _LAB_RULES_KEYS_HELP]
+        if others:
+            lines += ["", "**Convention files found** (assign with `/lab-rules <name>`):"]
+            lines += [f"- `{os.path.basename(p)}`" for p in others]
+        await cl.Message(content="\n".join(lines)).send()
         return
+
     body = json.dumps(LAB_RULES, indent=2, default=str)
     src = f" (from `{LAB_RULES_PATH}`)" if LAB_RULES_PATH else ""
-    await cl.Message(content=f"**Active lab rules**{src} — enforced on every `/plan` and `/sweep`:"
-                     f"\n```json\n{body}\n```").send()
+    lines = [f"**Active lab rules**{src} — enforced on every `/plan` and `/sweep`:",
+             f"```json\n{body}\n```", "", _LAB_RULES_KEYS_HELP]
+    if others:
+        lines += ["", "**Other convention files** (switch with `/lab-rules <name>`):"]
+        lines += [f"- `{os.path.basename(p)}`" for p in others]
+    await cl.Message(content="\n".join(lines)).send()
 
 
 def _fmt_default(v) -> str:
@@ -1064,7 +1119,8 @@ async def _handle_sweep(request: str):
             ctx = await cl.make_async(retrieve_context)(request)
             async with cl.Step(name="planning sweep", type="llm"):
                 spec = await cl.make_async(propose_sweep)(
-                    MODEL, request, _with_scope(ctx["text"]), cl.user_session.get("engine"))
+                    MODEL, request, _with_scope(ctx["text"]), cl.user_session.get("engine"),
+                    scope=dict(SCOPE))
 
     # Separate the planner telemetry (attempts / decline) from the spec before display/run.
     meta = spec.pop("_planner_meta", {}) if isinstance(spec, dict) else {}
@@ -1109,25 +1165,7 @@ async def _handle_sweep(request: str):
 
 def _format_sweep_table(rows: list[dict]) -> str:
     """Markdown comparison table: one row per variant."""
-    has_lat = any(r.get("latency_ms") is not None for r in rows)
-    has_ref = any(r.get("vs_ref_r") is not None for r in rows)
-    head = ["variant", "endpoint µV"]
-    if has_lat:
-        head.append("latency ms")
-    if has_ref:
-        head.append("vs-ref r")
-    head.append("status")
-    out = ["| " + " | ".join(head) + " |", "| " + " | ".join(["---"] * len(head)) + " |"]
-    for r in rows:
-        cells = [r.get("label") or "(base)",
-                 "—" if r.get("endpoint_uv") is None else f"{r['endpoint_uv']:.3f}"]
-        if has_lat:
-            cells.append("—" if r.get("latency_ms") is None else f"{r['latency_ms']:.0f}")
-        if has_ref:
-            cells.append("—" if r.get("vs_ref_r") is None else f"{r['vs_ref_r']:.4f}")
-        cells.append("✅" if r.get("ok") else f"❌ {str(r.get('error', ''))[:50]}")
-        out.append("| " + " | ".join(cells) + " |")
-    return "\n".join(out)
+    return format_sweep_table(rows, success="✅", failure="❌")
 
 
 def _format_stochastic(stochastic: list[dict]) -> str:
@@ -1146,7 +1184,7 @@ def _plot_spec_curve(rows: list[dict], spec: dict) -> str | None:
     import io
     import matplotlib.pyplot as plt
 
-    pts = [(r, r["endpoint_uv"]) for r in rows if r.get("endpoint_uv") is not None]
+    pts = [(r, r["endpoint_uv"]) for r in rows if r.get("ok") and r.get("endpoint_uv") is not None]
     if not pts:
         return None
     axes = spec.get("axes") or []
@@ -1182,18 +1220,31 @@ async def _run_sweep_and_render(spec: dict):
         )).send()
         return
     rows = result["rows"]
+    variant_images = result.pop("images", [])
     summary = result.get("summary") or {}
     png = await cl.make_async(_plot_spec_curve)(rows, spec)
     elements = [_png_element(png, "sweep.png")] if png else []
     cl.user_session.set("last_export", {
         "kind": "sweep", "spec": spec, "results": result,
-        "images": [("specification-curve", png)] if png else [],
+        "images": ([("specification-curve", png)] if png else []) + variant_images,
     })
     content = (f"**Sweep complete — {result['n_variants']} variants.**\n\n"
                + _format_sweep_table(rows))
     if summary.get("stochastic"):
         content += "\n\n" + _format_stochastic(summary["stochastic"])
+    if any(r.get("output_tool") in ("run_ica", "review_ica", "filter_eeg") for r in rows):
+        content += "\n\nThese are diagnostics, not a quality ranking. No best variant has been selected."
     await cl.Message(content=content, elements=elements).send()
+    figures = dict(variant_images)
+    for i, row in enumerate(rows, 1):
+        details = [cl.File(name=f"variant-{i}-results.json", display="inline",
+                           content=json.dumps(row, indent=2, default=str).encode())]
+        if row.get("figure") in figures:
+            details.append(_png_element(figures[row["figure"]], row["figure"] + ".png"))
+        note = (row.get("output") or {}).get("note")
+        await cl.Message(content=(f"**Variant {i}: {row['label']}**\n\n"
+                                  f"Final output: `{row.get('output_tool')}`."
+                                  + (f"\n\n{note}" if note else "")), elements=details).send()
 
 
 async def _handle_run():

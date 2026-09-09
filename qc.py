@@ -204,3 +204,35 @@ def find_lab_rules(*dirs: str) -> tuple[dict | None, str | None]:
                 if r is not None:
                     return r, p
     return None, None
+
+
+# The rule keys the linter understands; a file is treated as a lab-rules doc if it carries any.
+LAB_RULE_KEYS = ("require_steps", "forbid_steps", "order", "require_before", "param_equals")
+
+
+def looks_like_lab_rules(rules) -> bool:
+    """True if a parsed dict carries at least one recognised lab-rule key -- so codebooks / BIDS
+    sidecars / other JSON in the same folder are not mistaken for lab rules."""
+    return isinstance(rules, dict) and any(k in rules for k in LAB_RULE_KEYS)
+
+
+def discover_lab_rules(*dirs: str) -> list[tuple[str, dict]]:
+    """Find ALL lab-rules-like files (any name) across dirs so a lab can keep several conventions
+    and switch between them. A file counts only if it parses AND carries a recognised rule key.
+    Returns [(path, rules), ...], de-duplicated by absolute path, dirs in the given priority order."""
+    seen, out = set(), []
+    for d in dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        for name in sorted(os.listdir(d)):
+            if not name.lower().endswith((".json", ".yaml", ".yml")):
+                continue
+            p = os.path.join(d, name)
+            ap = os.path.abspath(p)
+            if ap in seen:
+                continue
+            rules = load_lab_rules(p)
+            if looks_like_lab_rules(rules):
+                seen.add(ap)
+                out.append((p, rules))
+    return out
