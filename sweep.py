@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import copy
 import itertools
+import re
+import time
 
 import numpy as np
 
@@ -41,6 +43,75 @@ from pipeline import validate_pipeline, run_pipeline, _TOOL_PARAMS
 MAX_VARIANTS = 24        # hard cap so a grid can never silently explode
 SEED_BASE = 97           # matches the project's ICA seed convention
 SEED_STEP = 13           # distinct, reproducible seeds for a `repeat` axis
+
+
+def _workflow_errors(steps: list[dict]) -> list[str]:
+    errors = []
+    if steps[0].get("tool") != "load_eeg":
+        errors.append("Each sweep variant starts from an empty session; base_pipeline must start with load_eeg.")
+    have_erp = False
+    for i, step in enumerate(steps):
+        name = step.get("tool")
+        if name in ("load_eeg", "create_epochs", "create_bins"):
+            have_erp = False
+        elif name in ("compute_erp", "compute_difference_erp"):
+            have_erp = True
+        elif name == "measure_component" and not have_erp:
+            errors.append(f"Step {i} (measure_component): no ERP producer precedes the measurement. "
+                          "Add compute_erp for one condition or compute_difference_erp for a contrast "
+                          "after epoching and before the endpoint; create_epochs alone does not average an ERP.")
+    return errors
+
+
+def validate_sweep_request(spec: dict, request: str, scope: dict | None = None) -> list[str]:
+    """Guard explicit 'epoch A vs B' contrasts without rewriting scientific choices."""
+    contrast = re.search(r"\bepoch\s+([\w-]+)\s+(?:vs\.?|versus|minus)\s+([\w-]+)\b", request, re.I)
+    if not contrast:
+        return []
+    names = [name.lower() for name in contrast.groups()]
+    steps = spec.get("base_pipeline") or []
+    if not isinstance(steps, list) or any(not isinstance(s, dict) or not isinstance(s.get("args", {}), dict) for s in steps):
+        return []  # structural validation reports these malformed steps
+    final_steps = steps + ([spec["endpoint"]] if isinstance(spec.get("endpoint"), dict) else [])
+    if not any(s.get("tool") in ("compute_erp", "compute_difference_erp", "measure_component") for s in final_steps):
+        return []  # epoch-only comparisons need not average or measure an ERP
+    differences = [s for s in steps if isinstance(s, dict) and s.get("tool") == "compute_difference_erp"]
+    errors = []
+    if len(differences) != 1:
+        errors.append(f"'epoch {names[0]} vs {names[1]}' requires one compute_difference_erp "
+                      "(first condition minus second), not separate condition variants.")
+    if any(a.get("param") in ("event_id", "event_id_a", "event_id_b")
+           for a in spec.get("axes", []) if isinstance(a, dict)):
+        errors.append("The requested contrast is fixed; do not add an event_id/condition sweep axis.")
+    if scope is not None:
+        conditions = {k.lower(): v for k, v in ((scope.get("codebook") or {}).get("conditions") or {}).items()}
+        if any(name not in conditions for name in names):
+            errors.append("Scope the recording and supply a codebook defining both contrast conditions; do not invent event codes.")
+        elif len(differences) == 1:
+            from tools import _iter_codebook_codes
+            bins = {b.get("label"): b.get("codes") for s in steps if s.get("tool") == "create_bins"
+                    for b in s.get("args", {}).get("bins", []) if isinstance(b, dict)}
+            for key, name in zip(("event_id_a", "event_id_b"), names):
+                selected = differences[0].get("args", {}).get(key)
+                try:
+                    expected = set(_iter_codebook_codes({"conditions": {name: conditions[name]}}))
+                    actual = set()
+                    labels = [selected] if isinstance(selected, str) else (selected or [])
+                    for label in labels:
+                        if not isinstance(label, str):
+                            raise ValueError("ERP event labels must be strings")
+                        if label in bins:
+                            actual.update(_iter_codebook_codes({"conditions": {name: bins[label]}}))
+                        else:
+                            actual.add(int(label))
+                except (TypeError, ValueError):
+                    actual, expected = set(), {None}
+                if actual != expected:
+                    errors.append(f"compute_difference_erp.{key} must select the scoped '{name}' "
+                                  f"codes {conditions[name]!r}; set its create_bins bin codes to "
+                                  f"{conditions[name]!r}. A range requires nested brackets: "
+                                  "codes=[[lo, hi]], not codes=[lo, hi] (which selects only two codes).")
+    return errors
 
 
 def _axis_value_list(axis: dict) -> list:
@@ -67,6 +138,15 @@ def expand_sweep(spec: dict) -> tuple[list[dict], list[str]]:
         return [], ["base_pipeline is empty or not a list."]
     if not isinstance(axes, list) or not axes:
         return [], ["No sweep axes were given (need at least one)."]
+    if any(not isinstance(step, dict) for step in base):
+        return [], ["Every base_pipeline step must be an object."]
+    endpoint = spec.get("endpoint")
+    if endpoint is not None:
+        if not isinstance(endpoint, dict) or endpoint.get("tool") not in _TOOL_PARAMS:
+            return [], ["endpoint must name a real tool, or be omitted to compare the final base_pipeline step."]
+        if endpoint in base:
+            return [], ["The endpoint duplicates a base_pipeline step. Execute the final operation only once: "
+                        "keep it in endpoint or in base_pipeline, not both."]
 
     errors: list[str] = []
     resolved: list[dict] = []
@@ -111,7 +191,10 @@ def expand_sweep(spec: dict) -> tuple[list[dict], list[str]]:
             pipe[a["step"]].setdefault("args", {})[a["param"]] = val
             assignments[f"{a['tool']}.{a['param']}"] = val
         label = ", ".join(f"{k}={v}" for k, v in assignments.items())
-        verrs = validate_pipeline({"pipeline": pipe})
+        complete = pipe + ([endpoint] if endpoint is not None else [])
+        verrs = validate_pipeline({"pipeline": complete})
+        if not verrs:
+            verrs = _workflow_errors(complete)
         if verrs:
             return [], [f"Variant [{label}] failed validation: " + "; ".join(verrs)]
         variants.append({"label": label, "assignments": assignments, "pipeline": pipe})
@@ -121,15 +204,10 @@ def expand_sweep(spec: dict) -> tuple[list[dict], list[str]]:
 def validate_sweep(spec: dict) -> list[str]:
     """Structural gate for a sweep spec: valid iff expand_sweep produces no errors.
 
-    Also requires an endpoint tool that exists, so every variant yields a comparable
-    scalar. Returns a list of problems ([] == valid).
+    Checks the full base-plus-optional-endpoint schema and any ERP prerequisite in
+    each clean-session variant. Returns a list of problems ([] == valid).
     """
-    _, errors = expand_sweep(spec)
-    endpoint = spec.get("endpoint") if isinstance(spec, dict) else None
-    if not isinstance(endpoint, dict) or endpoint.get("tool") not in _TOOL_PARAMS:
-        errors = list(errors) + [
-            "endpoint must name a real measurement tool (e.g. measure_component)."]
-    return errors
+    return expand_sweep(spec)[1]
 
 
 def _reset_session() -> None:
@@ -177,7 +255,7 @@ def _aggregate(spec: dict, rows: list[dict]) -> dict:
 
 
 async def run_sweep(spec: dict, run_step) -> dict:
-    """Execute a sweep: one full pipeline per variant, then the endpoint measurement.
+    """Execute each variant and compare its final tool result, scalar or otherwise.
 
     `run_step(name, args) -> (result, image_b64)` is the same dispatcher run_pipeline
     uses (in app.py that is `_run_tool`; headless tests pass a thin async wrapper around
@@ -193,28 +271,110 @@ async def run_sweep(spec: dict, run_step) -> dict:
     endpoint = spec.get("endpoint") or {}
     checkpoint = spec.get("compare_checkpoint")
     rows: list[dict] = []
-    for v in variants:
+    images = []
+    for vi, v in enumerate(variants, 1):
         _reset_session()
-        results, _images = await run_pipeline({"pipeline": v["pipeline"]}, run_step)
+        timings = []
+        final_image = None
+        async def checked_step(name, args):
+            nonlocal final_image
+            started = time.perf_counter()
+            value, image = await run_step(name, args)
+            timings.append(time.perf_counter() - started)
+            if not isinstance(value, dict):
+                value = {"ok": False, "error": "Tool returned no result object."}
+            else:
+                value = dict(value)
+                image = image or value.pop("image", None)
+                if value.get("error"):
+                    value["ok"] = False
+            final_image = image
+            return value, image
+        complete = v["pipeline"] + ([endpoint] if endpoint else [])
+        results, _images = await run_pipeline({"pipeline": complete}, checked_step)
         failed = next(
             (r["result"] for r in results
              if isinstance(r["result"], dict) and r["result"].get("ok") is False), None)
-        row = {"label": v["label"], "assignments": v["assignments"], "ok": failed is None}
+        final = results[-1]
+        output = final["result"]
+        row = {"label": v["label"], "assignments": v["assignments"], "ok": failed is None,
+               "output_tool": final["tool"], "output": output, "steps": results,
+               "elapsed_s": round(sum(timings), 3), "output_elapsed_s": round(timings[-1], 3),
+               "metrics": _result_metrics(output)}
+        if final_image:
+            figure_name = f"variant-{vi}-{final['tool']}"
+            images.append((figure_name, final_image))
+            row["figure"] = figure_name
         if failed is not None:
             row["error"] = failed.get("error", "a pipeline step failed")
             rows.append(row)
             continue
-        if endpoint.get("tool"):
-            ep = await _call(run_step, endpoint["tool"], endpoint.get("args", {}))
-            row["endpoint_uv"] = ep.get("amplitude_uv")
-            if ep.get("latency_ms") is not None:
-                row["latency_ms"] = ep.get("latency_ms")
-            if ep.get("ok") is False:
-                row["error"] = ep.get("error", "endpoint measurement failed")
+        if final["tool"] == "measure_component":
+            amplitude = output.get("amplitude_uv")
+            if isinstance(amplitude, bool) or not isinstance(amplitude, (int, float)) or not np.isfinite(amplitude):
+                row["ok"] = False
+                row["error"] = "Endpoint returned no finite amplitude_uv measurement."
+            else:
+                row["endpoint_uv"] = amplitude
+            if output.get("latency_ms") is not None:
+                row["latency_ms"] = output["latency_ms"]
         if checkpoint:
             cp = await _call(run_step, "compare_to_checkpoint", {"checkpoint": checkpoint})
             row["vs_ref_r"] = cp.get("min_r")
         rows.append(row)
 
-    return {"ok": True, "rows": rows,
+    return {"ok": True, "rows": rows, "images": images,
             "summary": _aggregate(spec, rows), "n_variants": len(variants)}
+
+
+def _result_metrics(result: dict) -> dict:
+    """Compact reported values only; do not invent a universal quality score."""
+    metrics = {}
+    for key, value in result.items():
+        if key in ("ok", "error", "traceback", "note", "image", "filepath", "saved"):
+            continue
+        if isinstance(value, (int, float, bool)) or (isinstance(value, str) and len(value) < 80):
+            metrics[key] = value
+        elif isinstance(value, dict):
+            for child, number in value.items():
+                if isinstance(number, (int, float)) and not isinstance(number, bool):
+                    metrics[f"{key}.{child}"] = number
+    return metrics
+
+
+def format_sweep_table(rows: list[dict], success: str = "ok", failure: str = "failed") -> str:
+    """Shared UI/export comparison: ERP amplitudes only for ERP measurement outputs."""
+    erp = any(r.get("output_tool") == "measure_component" or "endpoint_uv" in r for r in rows)
+    keys = []
+    if not erp:
+        for row in rows:
+            for key in row.get("metrics", {}):
+                if key not in keys:
+                    keys.append(key)
+        keys = keys[:6]
+    has_lat = any(r.get("latency_ms") is not None for r in rows)
+    has_ref = any(r.get("vs_ref_r") is not None for r in rows)
+    head = ["variant"] + (["endpoint (uV)"] if erp else ["final tool"] + keys + ["final step (s)"])
+    if has_lat:
+        head.append("latency (ms)")
+    if has_ref:
+        head.append("vs-ref r")
+    head.append("status")
+    def cell(value):
+        if value is None:
+            return "-"
+        if isinstance(value, float):
+            return f"{value:.3f}"
+        return str(value).replace("|", "\\|").replace("\n", " ")
+    lines = ["| " + " | ".join(head) + " |", "| " + " | ".join(["---"] * len(head)) + " |"]
+    for row in rows:
+        values = [row.get("label", "(base)")]
+        values += ([row.get("endpoint_uv")] if erp else [row.get("output_tool")] +
+                   [row.get("metrics", {}).get(k) for k in keys] + [row.get("output_elapsed_s")])
+        if has_lat:
+            values.append(row.get("latency_ms"))
+        if has_ref:
+            values.append(row.get("vs_ref_r"))
+        values.append(success if row.get("ok") else f"{failure} {row.get('error', '')}")
+        lines.append("| " + " | ".join(cell(v) for v in values) + " |")
+    return "\n".join(lines)
