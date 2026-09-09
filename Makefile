@@ -12,8 +12,8 @@ SAMPLE_URL ?=
 IMAGE := eeg-llm
 TAG ?= latest
 REGISTRY ?= ghcr.io/CHANGE-ME
-# Apple-Silicon testers only for now → arm64. Add linux/amd64 here if you later ship to Intel/WSL.
-PLATFORMS ?= linux/arm64
+# Prebuilt releases include both Intel/AMD and ARM.
+PLATFORMS ?= linux/amd64,linux/arm64
 ARCH := $(shell uname -m)
 
 .DEFAULT_GOAL := help

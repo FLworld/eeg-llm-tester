@@ -32,6 +32,12 @@ services:
       # Persistent app state (sessions, recipes, batches, model caches) across restarts.
       - eeg-state:/state
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--max-time", "5", "http://127.0.0.1:8001/"]
+      interval: 5s
+      timeout: 6s
+      start_period: 30s
+      retries: 24
 
 volumes:
   eeg-state:

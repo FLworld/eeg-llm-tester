@@ -17,7 +17,7 @@ die() { echo ""; echo "  ✗ $*" >&2; echo "" >&2; exit 1; }
 echo "→ eeg-llm: waiting for Ollama at ${OLLAMA_HOST} ..."
 tags=""
 for i in $(seq 1 30); do
-  if tags="$(curl -fsS "${OLLAMA_HOST}/api/tags" 2>/dev/null)"; then
+  if tags="$(curl --connect-timeout 2 --max-time 3 -fsS "${OLLAMA_HOST}/api/tags" 2>/dev/null)"; then
     echo "  ✓ Ollama reachable"
     break
   fi
@@ -28,11 +28,12 @@ done
     On Linux, ensure the container can resolve host.docker.internal (compose sets extra_hosts)."
 
 for m in "$CHAT_MODEL" "$EMBED_MODEL"; do
-  # Match the model name whether or not a :tag is present in the tags listing.
-  echo "$tags" | grep -q "\"${m}\(:[^\"]*\)\?\"" \
+  # Untagged model names mean :latest, not any available tag.
+  case "$m" in *:*) ;; *) m="${m}:latest" ;; esac
+  echo "$tags" | grep -Fq "\"${m}\"" \
     || die "Model '${m}' is not present in Ollama on the host.
     Run the one-time bootstrap on your machine:  make setup
-    (pulls qwen2.5-coder:14b + nomic-embed-text and builds eeg-qwen — ~18 GB, once)."
+    (pulls qwen2.5-coder:14b + nomic-embed-text and builds eeg-qwen — ~10 GB, once)."
 done
 echo "  ✓ models present: ${CHAT_MODEL}, ${EMBED_MODEL}"
 

@@ -1,0 +1,39 @@
+name: launch-tests
+
+# Validates the double-click launch process per commit:
+#   - windows-latest: the real Windows PowerShell launcher (parse + all mocked scenarios)
+#   - ubuntu-latest:  the bash launcher failure-paths + an amd64 image build + in-image smoke
+# NOTE: full Docker Desktop + Ollama end-to-end on Windows is NOT run here (no GPU/engine on the
+# hosted runner); that stays a manual pre-release check on a real Windows box. This job gives
+# genuine per-commit Windows-shell signal (path/quoting/exit codes) with docker/ollama mocked.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-launcher:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: PowerShell launcher — parse + mocked scenarios
+        shell: pwsh
+        env:
+          EEG_WORK: ${{ github.workspace }}
+        run: pwsh -NoProfile -File tests/install/test_windows.ps1
+
+  linux-launcher-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Bash launcher — failure-path tests (no downloads, no app)
+        run: python tests/install/test_launchers.py
+      - name: Build the app image (amd64) and run the in-image smoke test
+        run: |
+          docker build -t eeg-llm-ci:latest .
+          # smoke.py needs neither Ollama nor data; preflight.py does, so it is not run in CI.
+          docker run --rm --entrypoint python eeg-llm-ci:latest /usr/local/bin/smoke.py

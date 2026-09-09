@@ -58,7 +58,7 @@ COPY app.py pipeline.py engines.py tools.py prompt.py rag.py ingest.py exports.p
      artifact_break_removal.py artifact_continuous_detect.py artifact_epoch_reject.py \
      Modelfile chainlit.md ./
 COPY .chainlit/config.toml ./.chainlit/config.toml
-COPY docker/entrypoint.sh docker/smoke.py /usr/local/bin/
+COPY docker/entrypoint.sh docker/smoke.py docker/preflight.py /usr/local/bin/
 
 RUN chmod +x /usr/local/bin/entrypoint.sh \
     && mkdir -p /state /data /output /app/docs
