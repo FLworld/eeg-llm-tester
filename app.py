@@ -10,6 +10,7 @@ import datetime
 import inspect
 import json
 import os
+import re
 import shutil
 
 import chainlit as cl
@@ -743,6 +744,53 @@ def _detect_params_query(text: str) -> str | None:
     return "ASK" if strong else None   # weak/verb wording without a tool -> normal chat
 
 
+def _inspect_components_request(text: str) -> str | None:
+    """Recognize standalone inspection requests, not plans or compound actions."""
+    command = re.fullmatch(r"/inspect-ica(?:\s+(.*))?", text.strip(), re.I)
+    if command:
+        return command.group(1) or ""
+    match = re.fullmatch(
+        r"(?:please\s+|can you\s+)?(?:inspect|show|view)\s+(?:ICA\s+)?"
+        r"components?(?:\s+([\d\s,&.\[\]-]+(?:and[\d\s,&.\[\]-]+)*))?"
+        r"[.!?]?", text.strip(), re.I,
+    )
+    return (match.group(1) or "").rstrip(".!?").strip() if match else None
+
+
+async def _handle_inspect_components(arg: str, request: str):
+    values = arg.strip()
+    if values.startswith("[") and values.endswith("]"):
+        values = values[1:-1].strip()
+    if not re.fullmatch(r"\d+(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+|\s*&\s*|\s+)\d+)*",
+                        values, re.I):
+        await cl.Message(content=(
+            "Specify 1-based ICA component numbers, for example `/inspect-ica 1 8` "
+            "or `inspect components 1 and 8`. Inspection removes nothing."
+        )).send()
+        return
+    components = list(dict.fromkeys(int(n) for n in re.findall(r"\d+", values)))
+    if len(components) > 6:
+        await cl.Message(content="Inspect at most six ICA components at a time.").send()
+        return
+    out = cl.Message(content="Inspecting ICA components " + ", ".join(map(str, components)) + "...")
+    await out.send()
+    result, image_b64 = await _run_tool("inspect_ica_component", {"components": components})
+    if result.get("ok") is False:
+        out.content = "Could not inspect ICA components: " + result.get("error", "Unknown tool error.")
+    elif not image_b64:
+        out.content = "ICA inspection returned no plot. No components were removed."
+    else:
+        shown = result.get("components", components)
+        out.content = ("**ICA components " + ", ".join(map(str, shown))
+                       + " (1-based)**\n\nReview only. No components were removed.")
+        out.elements = [_png_element(image_b64, "ica-components.png")]
+    await out.update()
+    history = cl.user_session.get("history")
+    if history is not None:
+        history.extend([{"role": "user", "content": request},
+                        {"role": "assistant", "content": out.content}])
+
+
 async def _handle_engine(arg: str):
     """Set a session default, with explicit natural-language per-step overrides."""
     val = arg.strip().lower()
@@ -1473,6 +1521,10 @@ async def on_message(msg: cl.Message):
             return
 
     # --- deterministic pipeline commands (you dictate, code executes) ---
+    inspection = _inspect_components_request(text)
+    if inspection is not None:
+        await _handle_inspect_components(inspection, text)
+        return
     if text.startswith("/params"):
         await _handle_params(text[len("/params"):].strip())
         return
