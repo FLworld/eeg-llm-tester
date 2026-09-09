@@ -177,13 +177,13 @@ is a boolean -- pass true or false, never a [lo, hi] window.
 PLANNER_SWEEP_PROMPT = f"""You are the planning component of an EEG analysis toolkit. You \
 convert a user's request into a PARAMETER SWEEP: one base pipeline plus one or more axes that \
 vary a parameter, so the user can compare how a choice (e.g. a filter cutoff, filter window, or \
-an ICA seed) changes a downstream measurement. You do NOT run anything: you emit a spec that a \
+an ICA seed) changes the requested final output. You do NOT run anything: you emit a spec that a \
 human reviews and approves before it executes.
 
 Output ONLY a single JSON object, no prose and no markdown, of this exact shape:
 {{"base_pipeline": [{{"tool": "<tool_name>", "args": {{<arguments>}}}}],
  "axes": [{{"tool": "<tool_name>", "param": "<param>", "values": [<v1>, <v2>]}}],
- "endpoint": {{"tool": "measure_component", "args": {{<arguments>}}}},
+ "endpoint": {{"tool": "<optional final tool>", "args": {{<arguments>}}}},
  "notes": ["<assumption>"]}}
 
 Use ONLY these tools and ONLY their listed parameters ('*' = required):
@@ -201,8 +201,18 @@ Rules -- follow them exactly; they are what make the sweep trustworthy:
     engine supplies N distinct seeds, so use "repeat" with param "random_state", not "values".
   * "param" MUST be a real parameter of "tool" (from the catalog above). If several steps use the
     same tool, add "index": k to pick the k-th (0-based).
-- "endpoint" is the SINGLE measurement compared across variants -- normally measure_component with
-  the time window and channels the user named. Exactly one endpoint.
+- Output follows the FINAL operation the user requested, not a mandatory ERP measurement.
+  "endpoint" is OPTIONAL. Omit it to compare the last base_pipeline step's output. Use it only
+  for an additional requested final tool, which must not duplicate a step already in the base.
+  A filter-only sweep ends in filter_eeg, an ICA algorithm sweep ends in run_ica (or review_ica
+  if review was requested), a PSD sweep ends in compute_psd. Do NOT invent epoching, ERP
+  computation or measure_component when the user did not ask for those operations.
+  For a requested ERP measurement, use measure_component with the stated channels/time window.
+  It MUST follow compute_erp (one condition) or compute_difference_erp (contrast): create_epochs
+  alone does NOT produce an averaged ERP. Every variant starts EMPTY: begin with load_eeg.
+  For ICA algorithms use run_ica.algorithm as the axis, retaining the requested fit parameters.
+  Do not rank or recommend variants. Show the final tool's actual diagnostics/plots;
+  do not fabricate a score or add an ERP proxy.
 - Multiple grid axes multiply (a 3-value and a 2-value axis = 6 variants). Keep the total small
   (<= 24). Put the variant count and every assumption in "notes".
 - If the request is not a sweep (no parameter to vary), return {{"base_pipeline": [], "axes": [], \
@@ -214,6 +224,15 @@ Argument derivation -- same as normal planning:
 - Butterworth roll-off in dB/octave -> iir_order (6=1,12=2,18=3,24=4,30=5,36=6,48=8).
 - A high-pass-only filter -> set h_freq to null explicitly.
 - "reproduce ERPLAB/MATLAB exactly" -> filter_eeg engine="erplab".
+- "epoch A vs B" means a fixed A-minus-B CONTRAST, not a condition sweep. Use create_bins with
+  the EXACT full code ranges from the scoped codebook: codes=[[lo, hi]] denotes an inclusive
+  range; codes=[lo, hi] selects ONLY TWO codes, not a range. Use create_epochs without event_id (all bins),
+  then compute_difference_erp with event_id_a/event_id_b naming those bins and tmin/tmax matching
+  the epoch window. Never invent event codes or add event_id as an axis for this contrast.
+  If the codebook is missing, ask for it. With three high-pass values this is THREE variants.
+  For create_epochs.baseline use true for the pre-stimulus baseline or false to disable it.
+  Do not add a response-code restriction or remove_dc unless requested. State any chosen epoch
+  window or other necessary assumptions in notes.
 - Every axis tool MUST also appear as a step in base_pipeline (an axis varies a parameter of a \
 step that is actually in the pipeline). If you sweep resample.sfreq, include a resample step; \
 if you sweep run_ica.algorithm, include a run_ica step. Put a placeholder value there; the axis \
@@ -249,9 +268,6 @@ def _planner_messages(system: str, request: str, ctx_text: str | None) -> list[d
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-# Tools that yield the single scalar an endpoint compares across variants.
-_MEASUREMENT_TOOLS = sorted(
-    n for n in _TOOL_PARAMS if "measure" in n) or ["measure_component"]
 _ALL_PARAM_NAMES = sorted({p for params in _TOOL_PARAMS.values() for p in params})
 
 
@@ -261,7 +277,7 @@ def _sweep_schema() -> dict:
 
     Derived from the twin registry (`_TOOL_PARAMS`) so it never drifts. It makes whole error
     classes impossible to EMIT: an axis tool that isn't a real tool, an axis param that isn't a
-    real parameter of ANY tool, an endpoint that isn't a measurement tool, a scalar 'values'
+    real parameter of ANY tool, an endpoint that isn't a real tool, a scalar 'values'
     item, a non-integer 'repeat'. Cross-tool checks (param real but not on THAT tool; axis tool
     absent from base_pipeline) can't be expressed in a static schema and are left to
     validate_sweep + the repair loop. Args objects stay unconstrained (per-tool arg grammars
@@ -289,13 +305,12 @@ def _sweep_schema() -> dict:
     endpoint = {
         "type": "object",
         "properties": {
-            "tool": {"type": "string", "enum": _MEASUREMENT_TOOLS},
+            "tool": {"type": "string", "enum": tool_names},
             "args": {"type": "object"},
         },
         "required": ["tool", "args"],
     }
-    # endpoint is NOT required: a legitimate decline ("not a sweep") returns empty axes and no
-    # endpoint, and must not be forced to fabricate one.
+    # Without an explicit endpoint, compare the final base_pipeline operation.
     return {
         "type": "object",
         "properties": {
@@ -345,11 +360,22 @@ def _sanitize_sweep(spec: dict) -> list[str]:
     if dropped:
         spec.setdefault("notes", []).append(
             "dropped unrecognized args: " + ", ".join(sorted(set(dropped))))
+    base = spec.get("base_pipeline")
+    # A duplicated identical, read-only measurement adds no information. Deduplicate
+    # drafts only, never approved specs, and never remove an axis target.
+    if (isinstance(ep, dict) and ep.get("tool") == "measure_component"
+            and isinstance(base, list) and base and base[-1] == ep
+            and not any(a.get("tool") == "measure_component"
+                        for a in spec.get("axes", []) if isinstance(a, dict))):
+        base.pop()
+        spec.setdefault("notes", []).append(
+            "Removed duplicate measure_component from base_pipeline; its identical endpoint runs once.")
     return dropped
 
 
 def propose_sweep(model: str, request: str, ctx_text: str | None = None,
-                  engine: str | None = None, max_repairs: int = 2) -> dict:
+                  engine: str | None = None, max_repairs: int = 2,
+                  scope: dict | None = None) -> dict:
     """Translate a request into a sweep spec. Runs nothing.
 
     (a) Schema-CONSTRAINED decoding: `_sweep_schema()` is passed as `format=`, so the model can
@@ -362,14 +388,19 @@ def propose_sweep(model: str, request: str, ctx_text: str | None = None,
     Returns the spec; when repair is exhausted the last (still-invalid) spec is returned so the
     caller surfaces the errors. A `_planner_meta` key records attempts + whether it validated.
     """
-    from sweep import validate_sweep  # lazy: sweep imports pipeline (avoid import cycle)
+    from sweep import validate_sweep, validate_sweep_request  # lazy: avoid import cycle
 
     schema = _sweep_schema()
     resolved, selection_errors = engine_request(request, engine)
     if selection_errors:
         return {"base_pipeline": [], "axes": [], "notes": selection_errors,
                 "_planner_meta": {"attempts": 0, "valid": False, "errors": selection_errors}}
-    messages = _planner_messages(PLANNER_SWEEP_PROMPT + _engine_directive(engine, request),
+    codebook_context = ""
+    if scope and scope.get("codebook"):
+        codebook_context = ("\n\nScoped recording's authoritative event codebook (JSON):\n"
+                            + json.dumps(scope["codebook"], default=str)
+                            + "\nCopy each condition's codes exactly into its create_bins bin, preserving nested range lists.")
+    messages = _planner_messages(PLANNER_SWEEP_PROMPT + codebook_context + _engine_directive(engine, request),
                                  request, ctx_text)
     spec, errors = {}, ["no attempt"]
     for attempt in range(max_repairs + 1):
@@ -386,6 +417,8 @@ def propose_sweep(model: str, request: str, ctx_text: str | None = None,
             return spec
         _sanitize_sweep(spec)  # drop bogus arg KEYS before validating (deterministic, noted)
         errors = apply_engine_defaults(spec, resolved) + validate_sweep(spec)
+        if isinstance(spec, dict):
+            errors += validate_sweep_request(spec, request, scope)
         if not errors:
             spec.setdefault("_planner_meta", {})["attempts"] = attempt + 1
             spec["_planner_meta"]["valid"] = True

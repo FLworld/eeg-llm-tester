@@ -78,14 +78,9 @@ def _report(name: str, kind: str, created: str, spec_name: str, results, scope: 
         for i, row in enumerate(results or [], 1):
             lines.append(f"| {i} | `{row.get('tool', '?')}` | {_status(row.get('result'))} |")
     elif kind == "sweep":
+        from sweep import format_sweep_table
         rows = (results or {}).get("rows", []) if isinstance(results, dict) else []
-        lines += ["", "## Sweep Results", "", "| Variant | Endpoint (uV) | Status |",
-                  "|---|---:|---|"]
-        for row in rows:
-            endpoint = row.get("endpoint_uv")
-            endpoint_text = "" if endpoint is None else f"{float(endpoint):.4f}"
-            lines.append(f"| {row.get('label', '?')} | {endpoint_text} | "
-                         f"{'ok' if row.get('ok') else 'failed'} |")
+        lines += ["", "## Sweep Results", "", format_sweep_table(rows)]
         lines += ["", "A sweep does not save `processed.fif`: the in-memory EEG belongs only to "
                   "the final variant, not to the complete comparison."]
     return "\n".join(lines) + "\n"

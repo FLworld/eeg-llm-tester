@@ -1184,9 +1184,32 @@ def _plot_spec_curve(rows: list[dict], spec: dict) -> str | None:
     import io
     import matplotlib.pyplot as plt
 
+    ylabel = "endpoint (µV)"
     pts = [(r, r["endpoint_uv"]) for r in rows if r.get("ok") and r.get("endpoint_uv") is not None]
     if not pts:
-        return None
+        # Non-ERP sweep (filter/ICA/PSD): no endpoint amplitude, so plot a numeric metric across
+        # the variants -- prefer one that actually varies, else the first numeric metric.
+        ok_rows = [r for r in rows if r.get("ok")]
+        metric_keys = []
+        for r in ok_rows:
+            for k, v in (r.get("metrics") or {}).items():
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and k not in metric_keys:
+                    metric_keys.append(k)
+        def _vals(k):
+            return [r["metrics"][k] for r in ok_rows
+                    if isinstance((r.get("metrics") or {}).get(k), (int, float))
+                    and not isinstance(r["metrics"][k], bool)]
+        # Only plot a metric that actually VARIES across variants -- a flat line (e.g. n_channels
+        # constant) is misleading; the table already shows constant values.
+        chosen = next((k for k in metric_keys if len(set(_vals(k))) > 1), None)
+        if not chosen:
+            return None
+        pts = [(r, r["metrics"][chosen]) for r in ok_rows
+               if isinstance((r.get("metrics") or {}).get(chosen), (int, float))
+               and not isinstance(r["metrics"][chosen], bool)]
+        if len(pts) < 2:
+            return None  # a single point is not a comparison
+        ylabel = chosen
     axes = spec.get("axes") or []
     single_numeric = (len(axes) == 1 and axes[0].get("values")
                       and all(isinstance(v, (int, float)) for v in axes[0]["values"]))
@@ -1201,7 +1224,7 @@ def _plot_spec_curve(rows: list[dict], spec: dict) -> str | None:
         ax.bar(range(len(pts)), [y for _, y in pts])
         ax.set_xticks(range(len(pts)))
         ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=7)
-    ax.set_ylabel("endpoint (µV)")
+    ax.set_ylabel(ylabel)
     ax.set_title("Specification curve")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -1232,8 +1255,6 @@ async def _run_sweep_and_render(spec: dict):
                + _format_sweep_table(rows))
     if summary.get("stochastic"):
         content += "\n\n" + _format_stochastic(summary["stochastic"])
-    if any(r.get("output_tool") in ("run_ica", "review_ica", "filter_eeg") for r in rows):
-        content += "\n\nThese are diagnostics, not a quality ranking. No best variant has been selected."
     await cl.Message(content=content, elements=elements).send()
     figures = dict(variant_images)
     for i, row in enumerate(rows, 1):
@@ -1242,9 +1263,18 @@ async def _run_sweep_and_render(spec: dict):
         if row.get("figure") in figures:
             details.append(_png_element(figures[row["figure"]], row["figure"] + ".png"))
         note = (row.get("output") or {}).get("note")
+        labels = (row.get("output") or {}).get("labels")
+        label_text = ""
+        if isinstance(labels, list) and labels:
+            label_text = "\n\n| component (1-based) | label | confidence |\n| --- | --- | --- |\n"
+            label_text += "\n".join(
+                f"| {item.get('component')} | {item.get('label')} | {item.get('confidence')} |"
+                for item in labels if isinstance(item, dict))
+        elif isinstance(labels, dict) and labels.get("error"):
+            label_text = "\n\n" + str(labels["error"])
         await cl.Message(content=(f"**Variant {i}: {row['label']}**\n\n"
                                   f"Final output: `{row.get('output_tool')}`."
-                                  + (f"\n\n{note}" if note else "")), elements=details).send()
+                                  + (f"\n\n{note}" if note else "") + label_text), elements=details).send()
 
 
 async def _handle_run():

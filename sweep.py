@@ -18,7 +18,7 @@ SWEEP SPEC shape:
         {"tool": "filter_eeg", "param": "fir_window", "values": ["hamming", "kaiser"]},
         {"tool": "run_ica",    "param": "random_state", "repeat": 8}   # stochastic
       ],
-      "endpoint": {"tool": "measure_component", "args": {...}},        # one scalar/variant
+      "endpoint": {"tool": "measure_component", "args": {...}},        # optional final tool
       "compare_checkpoint": "hpfilt",                                  # optional grading
       "notes": [...]
     }
@@ -50,11 +50,21 @@ def _workflow_errors(steps: list[dict]) -> list[str]:
     if steps[0].get("tool") != "load_eeg":
         errors.append("Each sweep variant starts from an empty session; base_pipeline must start with load_eeg.")
     have_erp = False
+    epoch_window = None
     for i, step in enumerate(steps):
         name = step.get("tool")
+        args = step.get("args", {})
+        if name == "filter_eeg" and (args.get("engine") == "erplab" or args.get("method") == "iir") and args.get("iir_order") is None:
+            errors.append(f"Step {i} (filter_eeg): iir_order is required for IIR/ERPLAB filtering; "
+                          "use the requested order, or omit the unrequested IIR/ERPLAB choice.")
         if name in ("load_eeg", "create_epochs", "create_bins"):
             have_erp = False
+            epoch_window = ((args.get("tmin"), args.get("tmax")) if name == "create_epochs" else None)
         elif name in ("compute_erp", "compute_difference_erp"):
+            if name == "compute_difference_erp" and epoch_window is not None:
+                if (args.get("tmin"), args.get("tmax")) != epoch_window:
+                    errors.append(f"Step {i} (compute_difference_erp): tmin/tmax must match the existing "
+                                  f"create_epochs window {epoch_window}, not the component measurement window.")
             have_erp = True
         elif name == "measure_component" and not have_erp:
             errors.append(f"Step {i} (measure_component): no ERP producer precedes the measurement. "
