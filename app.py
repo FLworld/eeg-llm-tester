@@ -1231,8 +1231,9 @@ def _split_batch_arg(arg: str) -> tuple[str | None, str, str | None]:
         resolved = _resolve_dataset_dir(rest)
         if resolved:
             return toks[0], rest, resolved
-    # 4) nothing resolves: treat last token as dir (legacy), leave resolution to the caller's error
-    return (" ".join(toks[:-1]) or None), (toks[-1] if toks else arg), None
+    # 4) nothing resolves: report the WHOLE arg as the attempted dataset (spaced dirs are the common
+    #    case), so the error names what the user typed and can suggest quoting — not a bare last token.
+    return None, arg, None
 
 
 async def _handle_batch(arg: str):
