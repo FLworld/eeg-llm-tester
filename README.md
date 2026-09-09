@@ -11,16 +11,19 @@ GPU directly, so Ollama stays on the host and the app connects to it).
 
 ## Prerequisites
 
-- **macOS (Apple Silicon or Intel), Linux, or Windows (amd64).** On **Windows, use WSL2** (Ubuntu) and
-  run everything below inside it, so `make` and Docker behave like Linux.
+- **macOS (Apple Silicon or Intel), Linux, or Windows.** The double-click launcher works natively on
+  each; only the manual `make` path on **Windows** needs WSL2 (Docker Desktop uses it as its backend
+  either way, but you don't have to work inside an Ubuntu terminal).
 - **Docker Desktop** — https://docker.com (installed, and opened at least once so its engine runs)
 - **Ollama** — https://ollama.com (installed and running)
-- **~20 GB free disk** (the models) and **16 GB+ RAM** (the model is a 14B; less will swap and be slow)
+- **~40 GB free disk** (models + image build space) and **16 GB+ RAM** (the model is a 14B; less will swap and be slow)
 
 ## Setup
 
 **Step 0 — let the app reach Ollama (do this once).** By default Ollama listens only on `127.0.0.1`,
-which a container can't reach, so this one step avoids the most common snag. Pick your OS:
+which a container can't reach, so this one step avoids the most common snag. You don't have to do it
+up front — if you skip it, the launcher's preflight (and `make doctor`) reports the exact fix — but
+doing it once now is simplest. Pick your OS:
 
 - **macOS:**
   ```bash
@@ -33,7 +36,19 @@ which a container can't reach, so this one step avoids the most common snag. Pic
 - **Windows (WSL2):** in PowerShell, `setx OLLAMA_HOST 0.0.0.0:11434`, then quit and reopen Ollama.
   (`host.docker.internal` is automatic on Docker Desktop.)
 
-**Steps 1–5 — clone and run:**
+**Easiest — double-click (recommended).** One step does everything (model setup, image build,
+prerequisite checks, launch) and is idempotent, so it's also how you start day-to-day:
+
+- **macOS:** double-click **`Start eeg-llm.command`**
+- **Windows:** double-click **`Start eeg-llm.bat`**
+- **Linux:** run **`./start-eeg-llm.sh`**
+
+The first run pulls the models and builds the image (~40 GB, one-time, 5–20 min); later runs reuse
+them. When it prints `Ready:` the browser opens at **http://127.0.0.1:8001**. See `START-HERE.html`
+for the full illustrated walkthrough. (Diagnostics only: add `--check` on Mac/Linux or `-Check` on
+Windows; stop with `--stop` / `-Stop`.)
+
+**Or, step by step with `make`** (any platform; on Windows run these inside WSL2):
 
 ```bash
 git clone <repo-url> && cd eeg-llm-tester
@@ -44,10 +59,6 @@ make run       # starts the app
 ```
 
 Then open **http://127.0.0.1:8001**. (If `make doctor` is all green, you're ready.)
-
-**Option: double-click to start.** After the one-time setup, you don't need the terminal for
-day-to-day starts. On **macOS**, double-click **`Start eeg-llm.command`**; on **Linux/WSL**, run
-**`./start-eeg-llm.sh`**. It builds/pulls only if needed, checks prerequisites, and launches the app.
 
 ## Try the bundled sample
 
