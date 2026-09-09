@@ -800,12 +800,18 @@ def _detect_params_query(text: str) -> str | None:
 
 
 def _inspect_components_request(text: str) -> str | None:
-    """Recognize standalone inspection requests, not plans or compound actions."""
+    """Recognize standalone inspection requests, not plans or compound actions.
+
+    Also accepts the verbs review/overview WHEN specific component numbers follow: "review the
+    ICA components 1 and 8" names components, so it is an inspect-those, not the whole-line-up scan
+    view (routing sends a numberless "review ... components" to _review_ica_request instead).
+    """
     command = re.fullmatch(r"/inspect-ica(?:\s+(.*))?", text.strip(), re.I)
     if command:
         return command.group(1) or ""
     match = re.fullmatch(
-        r"(?:please\s+|can you\s+)?(?:inspect|show|view)\s+(?:ICA\s+)?"
+        r"(?:please\s+|can you\s+)?(?:inspect|show|view|review|overview)\s+"
+        r"(?:the\s+)?(?:ICA\s+)?"
         r"components?(?:\s+([\d\s,&.\[\]-]+(?:and[\d\s,&.\[\]-]+)*))?"
         r"[.!?]?", text.strip(), re.I,
     )
@@ -879,16 +885,19 @@ async def _handle_review_ica():
         out.content = "ICA review returned no plot. No components were removed."
     else:
         rows = result.get("eog_correlation_table") or []
-        lines = ["**ICA component review** — topography grid + EOG correlation. "
-                 "Review only; nothing removed."]
+        n = result.get("n_components") or len(rows)
+        lines = [f"**ICA component review** — all {n} components: the topography grid is shown "
+                 "inline below, with the EOG-correlation table for every component. Review only; "
+                 "nothing removed."]
         if rows:
             lines += ["", "| comp | r_max (EOG) | ICLabel |", "|---:|---:|---|"]
-            for r in rows[:10]:
+            for r in rows:  # every component, not just the top few
                 rmax = r.get("r_max")
                 rmax_s = f"{rmax:.2f}" if isinstance(rmax, (int, float)) else "-"
                 lines.append(f"| {r.get('component')} | {rmax_s} | {r.get('iclabel') or '-'} |")
-            lines.append("\nHigh r_max + frontal topography = eye-artifact candidate. Inspect a "
-                         "candidate with `/inspect-ica <n>`, then remove it via the plan's apply_ica step.")
+            lines.append("\n(Sorted by EOG correlation.) High r_max + frontal topography = "
+                         "eye-artifact candidate. Inspect one with `/inspect-ica <n>`, then remove it "
+                         "via the plan's apply_ica step.")
         out.content = "\n".join(lines)
         out.elements = [_png_element(image_b64, "ica-review.png")]
     await out.update()
@@ -1655,11 +1664,16 @@ async def on_message(msg: cl.Message):
 
     # --- deterministic pipeline commands (you dictate, code executes) ---
     inspection = _inspect_components_request(text)
-    if inspection is not None:
+    # A request naming specific component numbers is an inspect-those, even phrased as "review the
+    # ICA components 1 and 8". A numberless review/overview is the whole-line-up scan view.
+    if inspection and re.search(r"\d", inspection):
         await _handle_inspect_components(inspection, text)
         return
     if _review_ica_request(text):
         await _handle_review_ica()
+        return
+    if inspection is not None:
+        await _handle_inspect_components(inspection, text)
         return
     if text.startswith("/params"):
         await _handle_params(text[len("/params"):].strip())
