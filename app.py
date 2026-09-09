@@ -791,6 +791,55 @@ async def _handle_inspect_components(arg: str, request: str):
                         {"role": "assistant", "content": out.content}])
 
 
+def _review_ica_request(text: str) -> bool:
+    """Recognize a standalone ICA overview/line-up request (the tune_ica-style scan view).
+
+    Distinct from the single-component inspect route: this uses the verbs review/overview (not
+    inspect/show/view) so the two never collide, and takes no component numbers.
+    """
+    t = text.strip()
+    if re.fullmatch(r"/review-ica\b.*", t, re.I):
+        return True
+    # verb-first: "review/overview [the] [ICA] [components]"
+    if re.fullmatch(
+        r"(?:please\s+|can you\s+)?(?:review|overview)\s+(?:the\s+)?(?:ICA\s+)?"
+        r"(?:components?|overview|line[-\s]?up|decomposition)?[.!?]?", t, re.I):
+        return True
+    # noun-first: "ICA/component overview" / "ICA line-up"
+    return bool(re.fullmatch(
+        r"(?:the\s+)?(?:ICA|components?)\s+(?:overview|line[-\s]?up)[.!?]?", t, re.I))
+
+
+async def _handle_review_ica():
+    """Render the ICA scan view: topography grid + EOG-correlation table (review_ica). Removes nothing."""
+    out = cl.Message(content="Reviewing the ICA component line-up…")
+    await out.send()
+    result, image_b64 = await _run_tool("review_ica", {})
+    if result.get("ok") is False:
+        out.content = "Could not review ICA: " + result.get("error", "Unknown tool error.")
+    elif not image_b64:
+        out.content = "ICA review returned no plot. No components were removed."
+    else:
+        rows = result.get("eog_correlation_table") or []
+        lines = ["**ICA component review** — topography grid + EOG correlation. "
+                 "Review only; nothing removed."]
+        if rows:
+            lines += ["", "| comp | r_max (EOG) | ICLabel |", "|---:|---:|---|"]
+            for r in rows[:10]:
+                rmax = r.get("r_max")
+                rmax_s = f"{rmax:.2f}" if isinstance(rmax, (int, float)) else "-"
+                lines.append(f"| {r.get('component')} | {rmax_s} | {r.get('iclabel') or '-'} |")
+            lines.append("\nHigh r_max + frontal topography = eye-artifact candidate. Inspect a "
+                         "candidate with `/inspect-ica <n>`, then remove it via the plan's apply_ica step.")
+        out.content = "\n".join(lines)
+        out.elements = [_png_element(image_b64, "ica-review.png")]
+    await out.update()
+    history = cl.user_session.get("history")
+    if history is not None:
+        history.extend([{"role": "user", "content": "review ICA components"},
+                        {"role": "assistant", "content": out.content}])
+
+
 async def _handle_engine(arg: str):
     """Set a session default, with explicit natural-language per-step overrides."""
     val = arg.strip().lower()
@@ -1524,6 +1573,9 @@ async def on_message(msg: cl.Message):
     inspection = _inspect_components_request(text)
     if inspection is not None:
         await _handle_inspect_components(inspection, text)
+        return
+    if _review_ica_request(text):
+        await _handle_review_ica()
         return
     if text.startswith("/params"):
         await _handle_params(text[len("/params"):].strip())
