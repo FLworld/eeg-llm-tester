@@ -907,6 +907,177 @@ async def _handle_review_ica():
                         {"role": "assistant", "content": out.content}])
 
 
+# --------------------------------------------------------------------------- #
+# Deterministic in-session "remove ICA components -> [epoch A vs B] -> [measure]" executor.
+# The compound apply-and-analyze one-liner MUST run in-session (it uses the ICA fitted earlier;
+# /plan's load_eeg would wipe it), and the local model is unreliable at emitting the chained tool
+# calls. So we parse and execute it deterministically. Faithful: nothing is invented -- if the
+# epoch window, a codebook condition, the channel, or the measurement window is missing, we fail
+# loud and say what to add, never substitute a task-specific default (e.g. ERP CORE's -200..800 ms).
+# --------------------------------------------------------------------------- #
+_ELECTRODE_RE = r"[A-Za-z]{1,3}\d{0,2}[zZ]?"
+
+
+def _apply_ica_compound_request(text: str) -> bool:
+    """True for "remove/drop/reject/exclude [the] ICA component(s) <number> ...">."""
+    return bool(re.match(
+        r"\s*(?:remove|drop|reject|exclude)\s+(?:the\s+)?ICA\s+components?\s+\d",
+        text, re.I))
+
+
+def _ms_window(m) -> tuple[float, float]:
+    """(lo, hi) match groups in ms/s -> seconds."""
+    lo, hi, unit = float(m.group(1)), float(m.group(2)), (m.group(3) or "ms").lower()
+    return (lo, hi) if unit == "s" else (lo / 1000.0, hi / 1000.0)
+
+
+def _resolve_condition_codes(name: str, conditions: dict) -> list | None:
+    """Resolve a spoken condition ('faces') to the codebook's code list, tolerant of plural/case."""
+    if not name or not conditions:
+        return None
+    want = name.strip().lower()
+    for key, codes in conditions.items():
+        k = key.lower()
+        if k == want or k == want.rstrip("s") or k.rstrip("s") == want.rstrip("s"):
+            return codes
+    return None
+
+
+def _parse_apply_ica_compound(text: str) -> dict:
+    """Parse the compound request into fields + a list of blocking errors (faithful: no defaults)."""
+    p: dict = {"errors": []}
+    # components to remove: the number list right after "components", before any "then"/"epoch"
+    m = re.search(r"components?\s+(.*)", text, re.I)
+    head = re.split(r"\bthen\b|\bepoch\w*\b|\bmeasure\b|;", m.group(1), maxsplit=1, flags=re.I)[0] if m else ""
+    p["components"] = [int(n) for n in re.findall(r"\d+", head)]
+    if not p["components"]:
+        p["errors"].append("no component numbers to remove (e.g. 'remove ICA components 1 and 7').")
+
+    # optional contrast: "epoch A vs/versus/minus B"
+    mc = re.search(r"epoch\w*\s+(?:the\s+)?(\w+)\s+(?:vs\.?|versus|minus|against|v\.?)\s+(\w+)",
+                   text, re.I)
+    p["cond_a"] = mc.group(1) if mc else None
+    p["cond_b"] = mc.group(2) if mc else None
+
+    # Split at the measurement keyword: the EPOCH window is sought only BEFORE it, the MEASUREMENT
+    # window only after it. This prevents the epoch parse from greedily swallowing the measurement
+    # window when no epoch window was given (which would silently epoch the wrong span).
+    _range = r"(-?\d+(?:\.\d+)?)\s*(?:to|-|–|—)\s*(-?\d+(?:\.\d+)?)\s*(ms|s)\b"
+    mkw = re.search(r"\b(?:measure|mean|peak|amplitude)\b", text, re.I)
+    pre = text[:mkw.start()] if mkw else text
+    post = text[mkw.start():] if mkw else ""
+    mm = re.search(_range, post, re.I)
+    if mm:
+        p["meas_tmin"], p["meas_tmax"] = _ms_window(mm)
+    me = re.search(_range, pre, re.I)  # epoch window must appear in the pre-measurement clause
+    if me:
+        p["epoch_tmin"], p["epoch_tmax"] = _ms_window(me)
+
+    # channel: "at [channel] PO8"
+    mch = re.search(rf"\bat\s+(?:channel\s+)?({_ELECTRODE_RE})\b", text, re.I)
+    p["channel"] = mch.group(1) if mch else None
+    p["mode"] = "peak" if re.search(r"\bpeak\b", text, re.I) else "mean"
+    p["wants_measure"] = bool(re.search(r"\b(measure|mean|peak|amplitude)\b", text, re.I))
+    p["wants_epoch"] = bool(mc)
+    return p
+
+
+async def _handle_apply_ica_compound(text: str):
+    """Execute remove-components (-> epoch contrast -> measure) deterministically, in session."""
+    p = _parse_apply_ica_compound(text)
+    if p["errors"]:
+        await cl.Message(content="Cannot run that: " + " ".join(p["errors"])).send()
+        return
+
+    # 1) apply_ica -- the must-be-in-session action (uses the ICA fitted earlier this session)
+    result, image_b64 = await _run_tool("apply_ica", {"components": p["components"]})
+    if result.get("ok") is False:
+        await cl.Message(content="Could not remove components: "
+                         + result.get("error", "Unknown tool error.")).send()
+        return
+    msg = cl.Message(content=f"Removed ICA components {p['components']} (in-session).")
+    if image_b64:
+        msg.elements = [_png_element(image_b64, "apply-ica.png")]
+    await msg.send()
+
+    if not (p["wants_epoch"] or p["wants_measure"]):
+        return  # remove-only request: done
+
+    # 2) contrast: resolve codes from the scoped codebook, bin -> epoch -> difference wave
+    if p["wants_epoch"]:
+        conditions = (SCOPE.get("codebook") or {}).get("conditions") or {}
+        if not conditions:
+            await cl.Message(content=(
+                "Removed the components, but cannot epoch the contrast: no event codebook is "
+                "scoped. Run `/scope <file>` (or drop the recording) so 'faces vs cars' resolves "
+                "to codes, then re-issue the epoch/measure part.")).send()
+            return
+        codes_a = _resolve_condition_codes(p["cond_a"], conditions)
+        codes_b = _resolve_condition_codes(p["cond_b"], conditions)
+        missing = [n for n, c in ((p["cond_a"], codes_a), (p["cond_b"], codes_b)) if c is None]
+        if missing:
+            await cl.Message(content=(
+                f"Removed the components, but these conditions are not in the codebook: {missing}. "
+                f"Known conditions: {sorted(conditions)}.")).send()
+            return
+        if "epoch_tmin" not in p:
+            await cl.Message(content=(
+                "Removed the components, but no epoch window was given, and I won't assume one "
+                "(that would bake in a task-specific value). Add it explicitly, e.g. "
+                "'epoch faces vs cars from -200 to 800 ms'.")).send()
+            return
+        et0, et1 = p["epoch_tmin"], p["epoch_tmax"]
+        r, _ = await _run_tool("create_bins", {"bins": [
+            {"label": "B1", "codes": codes_a}, {"label": "B2", "codes": codes_b}]})
+        if r.get("ok") is False:
+            await cl.Message(content="create_bins failed: " + r.get("error", "?")).send()
+            return
+        r, _ = await _run_tool("create_epochs", {"tmin": et0, "tmax": et1})
+        if r.get("ok") is False:
+            await cl.Message(content="create_epochs failed: " + r.get("error", "?")).send()
+            return
+        chans = [p["channel"]] if p["channel"] else None
+        r, image_b64 = await _run_tool("compute_difference_erp", {
+            "event_id_a": "B1", "event_id_b": "B2", "tmin": et0, "tmax": et1,
+            "channels": chans, "plot_style": "channels"})
+        if r.get("ok") is False:
+            await cl.Message(content="compute_difference_erp failed: " + r.get("error", "?")).send()
+            return
+        dm = cl.Message(content=(f"Difference wave {p['cond_a']} minus {p['cond_b']} "
+                                 f"({r.get('n_epochs_a')} vs {r.get('n_epochs_b')} epochs)."))
+        if image_b64:
+            dm.elements = [_png_element(image_b64, "difference-erp.png")]
+        await dm.send()
+
+    # 3) measure the component on the stored difference wave
+    if p["wants_measure"]:
+        if "meas_tmin" not in p or not p["channel"]:
+            need = []
+            if "meas_tmin" not in p:
+                need.append("a measurement window (e.g. '110-150 ms')")
+            if not p["channel"]:
+                need.append("a channel (e.g. 'at PO8')")
+            await cl.Message(content="Skipped the measurement: missing " + " and ".join(need)
+                             + ".").send()
+            return
+        r, image_b64 = await _run_tool("measure_component", {
+            "tmin": p["meas_tmin"], "tmax": p["meas_tmax"],
+            "channels": [p["channel"]], "mode": p["mode"]})
+        if r.get("ok") is False:
+            await cl.Message(content="measure_component failed: " + r.get("error", "?")).send()
+            return
+        val = r.get("amplitude_uv")
+        val_s = f"{val:.3f} µV" if isinstance(val, (int, float)) else str(val)
+        lat = r.get("latency_ms")
+        extra = f" at {lat} ms" if p["mode"] == "peak" and isinstance(lat, (int, float)) else ""
+        mm = cl.Message(content=(f"**{p['mode'].title()} amplitude {p['meas_tmin']*1000:.0f}–"
+                                 f"{p['meas_tmax']*1000:.0f} ms at {p['channel']}: {val_s}{extra}** "
+                                 "(eye-corrected, this pipeline)."))
+        if image_b64:
+            mm.elements = [_png_element(image_b64, "measure.png")]
+        await mm.send()
+
+
 async def _handle_engine(arg: str):
     """Set a session default, with explicit natural-language per-step overrides."""
     val = arg.strip().lower()
@@ -1674,6 +1845,10 @@ async def on_message(msg: cl.Message):
         return
     if inspection is not None:
         await _handle_inspect_components(inspection, text)
+        return
+    # deterministic in-session "remove ICA components N... [then epoch A vs B and measure ...]"
+    if _apply_ica_compound_request(text):
+        await _handle_apply_ica_compound(text)
         return
     if text.startswith("/params"):
         await _handle_params(text[len("/params"):].strip())
