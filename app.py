@@ -499,11 +499,15 @@ async def _handle_scope(arg: str):
             "condition codes."
         )).send()
         return
-    async with cl.Step(name="scope", type="tool"):
-        res = await cl.make_async(scope_eeg)(path)
+    try:
+        async with cl.Step(name="scope", type="tool"):
+            res = await cl.make_async(scope_eeg)(path)
+    except Exception as exc:
+        await cl.Message(content=f"**Scope failed:** {exc}").send()
+        return False
     if not res.get("ok"):
         await cl.Message(content=f"**Scope failed:** {res.get('error', 'unknown')}").send()
-        return
+        return False
     lines = [f"**Scoped** `{os.path.basename(path)}` ({res['kind']}).",
              f"- {res['n_channels']} channels @ {res['sfreq']} Hz",
              f"- {res['n_event_codes']} distinct event codes"]
@@ -522,6 +526,12 @@ async def _handle_scope(arg: str):
     for w in res.get("warnings") or []:
         lines.append(f"- ⚠ {w}")
     await cl.Message(content="\n".join(lines)).send()
+    pending = cl.user_session.get("pending_codebook_uploads") or []
+    if pending:
+        if not await _apply_dropped_codebook(pending):
+            return False
+        cl.user_session.set("pending_codebook_uploads", None)
+    return True
 
 
 async def _handle_codebook(arg: str):
@@ -1191,29 +1201,71 @@ def _format_batch_table(rows: list[dict]) -> str:
     return "\n".join(out)
 
 
+def _resolve_dataset_dir(path: str) -> str | None:
+    """A dataset dir as typed, or resolved against DATA_DIR. None if neither is a directory."""
+    for cand in (path, os.path.join(DATA_DIR, path)):
+        if cand and os.path.isdir(cand):
+            return cand
+    return None
+
+
+def _split_batch_arg(arg: str) -> tuple[str | None, str, str | None]:
+    """Parse `[recipe-name] <dataset-dir>` robustly. The dataset dir may contain spaces (e.g.
+    'erpcore_n170 copy') and may be quoted, so a plain last-token split is wrong. Returns
+    (recipe_name_or_None, resolved_dataset_dir_or_raw, resolved_or_None). We disambiguate by
+    checking which candidate actually exists (as typed or under DATA_DIR), never by whitespace."""
+    arg = arg.strip()
+    # 1) quoted dataset dir, optionally preceded by a recipe name: n170 "erpcore_n170 copy"
+    m = re.match(r'^(?:(.*?)\s+)?["\'](.+?)["\']\s*$', arg)
+    if m:
+        raw = m.group(2)
+        return ((m.group(1) or "").strip() or None), raw, _resolve_dataset_dir(raw)
+    # 2) the WHOLE arg is a directory (no recipe) -- covers a bare spaced name like 'erpcore_n170 copy'
+    resolved = _resolve_dataset_dir(arg)
+    if resolved:
+        return None, arg, resolved
+    # 3) recipe + dir: peel the FIRST token as the recipe, the rest (spaces allowed) as the dir
+    toks = arg.split()
+    if len(toks) >= 2:
+        rest = " ".join(toks[1:])
+        resolved = _resolve_dataset_dir(rest)
+        if resolved:
+            return toks[0], rest, resolved
+    # 4) nothing resolves: treat last token as dir (legacy), leave resolution to the caller's error
+    return (" ".join(toks[:-1]) or None), (toks[-1] if toks else arg), None
+
+
 async def _handle_batch(arg: str):
     """Run a plan across every subject in a BIDS dataset. Usage:
     `/batch [recipe-name] <dataset-dir>` — a saved plan recipe, or the staged /plan if omitted."""
-    parts = arg.split()
-    if not parts:
+    if not arg.strip():
         await cl.Message(content=(
             "Usage: `/batch [recipe-name] <dataset-dir>` — run a plan on every `sub-*/` in a "
-            "BIDS dataset.\n- `/batch n170 data/erpcore_n170` uses a saved recipe (`/save-plan n170`)\n"
-            "- `/batch data/erpcore_n170` uses the plan you just `/plan`-ned (staged).\n"
+            "BIDS dataset.\n- `/batch n170 erpcore_n170` uses a saved recipe (`/save-plan n170`)\n"
+            "- `/batch erpcore_n170` uses the plan you just `/plan`-ned (staged).\n"
+            "- Paths with spaces work too, e.g. `/batch \"erpcore_n170 copy\"`.\n"
             "The plan should end in `measure_component` (that's the per-subject endpoint)."
         )).send()
         return
 
-    # Resolve the plan spec: last arg is the dataset dir; an optional first arg is a recipe name.
-    dataset_dir = parts[-1]
+    recipe_name, dataset_raw, dataset_dir = _split_batch_arg(arg)
+    if dataset_dir is None:
+        listing = [d for d in sorted(os.listdir(DATA_DIR))
+                   if os.path.isdir(os.path.join(DATA_DIR, d))] if os.path.isdir(DATA_DIR) else []
+        hint = ("\n\nDirectories in your data folder: "
+                + ", ".join(f"`{d}`" for d in listing[:20])) if listing else ""
+        await cl.Message(content=(
+            f"No dataset directory `{dataset_raw}` (looked as-is and under your data folder). "
+            f"If the name has spaces, quote it: `/batch \"{dataset_raw}\"`.{hint}")).send()
+        return
+
     spec = None
     source = ""
-    if len(parts) >= 2:
-        rec = load_recipe(" ".join(parts[:-1]), kind="plan")
+    if recipe_name:
+        rec = load_recipe(recipe_name, kind="plan")
         if rec is None:
-            await cl.Message(content=f"No saved plan recipe named "
-                             f"`{' '.join(parts[:-1])}`. See `/recipes`, or omit the name to "
-                             "use your staged `/plan`.").send()
+            await cl.Message(content=f"No saved plan recipe named `{recipe_name}`. See "
+                             "`/recipes`, or omit the name to use your staged `/plan`.").send()
             return
         spec, source = {"pipeline": rec["spec"].get("pipeline", [])}, f"recipe '{rec['name']}'"
     else:
@@ -1275,6 +1327,15 @@ def _run_batch_sync(spec: dict, dataset_dir: str) -> dict:
     return asyncio.run(run_batch(spec, dataset_dir, _step))
 
 
+def _sweep_scope_prefix(request: str) -> tuple[str | None, str]:
+    """Extract an explicit leading scope instruction, including quoted paths."""
+    match = re.match(r'''^\s*/?scope\s+(?:"([^"]+)"|'([^']+)'|([^,;\n]+))\s*[,;\n]\s*(.+)$''',
+                     request, re.I | re.S)
+    if not match:
+        return None, request
+    return next(value.strip() for value in match.groups()[:3] if value is not None), match.group(4).strip()
+
+
 async def _handle_sweep(request: str):
     """Draft a parameter-sweep spec, validate it, show the grid, and stage it for /run."""
     if not request:
@@ -1287,6 +1348,12 @@ async def _handle_sweep(request: str):
         )).send()
         return
 
+    scope_path, request = _sweep_scope_prefix(request)
+    if scope_path is not None:
+        cl.user_session.set("pending_sweep", None)
+        cl.user_session.set("pending_pipeline", None)
+        if not await _handle_scope(scope_path):
+            return
     spec = _try_parse_sweep(request)
     source = "your spec (verbatim, no model)"
     if spec is None:
@@ -1338,6 +1405,9 @@ async def _handle_sweep(request: str):
     grid = "\n".join(f"{i + 1}. {v['label']}" for i, v in enumerate(variants))
     notes = spec.get("notes") or []
     note_md = ("\n\n**Notes / assumptions:**\n- " + "\n- ".join(notes)) if notes else ""
+    final_tool = (spec.get("endpoint") or spec["base_pipeline"][-1])["tool"]
+    if final_tool == "filter_eeg":
+        note_md += "\n\n**Filter diagnostics:** mean EEG PSD from 0 Hz to Nyquist for each variant, plus an overlaid comparison."
     await cl.Message(content=(
         f"**Proposed sweep** ({source}{repaired}) — **{len(variants)} variants**. Review, then "
         "`/run` to execute *exactly this* (no model in the loop), or `/cancel`:\n"
@@ -1367,6 +1437,8 @@ def _plot_spec_curve(rows: list[dict], spec: dict) -> str | None:
     import io
     import matplotlib.pyplot as plt
 
+    if any(row.get("output_tool") == "filter_eeg" for row in rows):
+        return None  # Filter sweeps compare spectra, not their input cutoffs against themselves.
     ylabel = "endpoint (µV)"
     pts = [(r, r["endpoint_uv"]) for r in rows if r.get("ok") and r.get("endpoint_uv") is not None]
     if not pts:
@@ -1428,11 +1500,13 @@ async def _run_sweep_and_render(spec: dict):
     rows = result["rows"]
     variant_images = result.pop("images", [])
     summary = result.get("summary") or {}
-    png = await cl.make_async(_plot_spec_curve)(rows, spec)
+    comparison_name = result.get("comparison_figure")
+    png = (dict(variant_images).get(comparison_name) if comparison_name else
+           await cl.make_async(_plot_spec_curve)(rows, spec))
     elements = [_png_element(png, "sweep.png")] if png else []
     cl.user_session.set("last_export", {
         "kind": "sweep", "spec": spec, "results": result,
-        "images": ([("specification-curve", png)] if png else []) + variant_images,
+        "images": ([("specification-curve", png)] if png and not comparison_name else []) + variant_images,
     })
     content = (f"**Sweep complete — {result['n_variants']} variants.**\n\n"
                + _format_sweep_table(rows))
@@ -1441,11 +1515,23 @@ async def _run_sweep_and_render(spec: dict):
     await cl.Message(content=content, elements=elements).send()
     figures = dict(variant_images)
     for i, row in enumerate(rows, 1):
-        details = [cl.File(name=f"variant-{i}-results.json", display="inline",
+        details = [cl.File(name=f"variant-{i}-results.json", display="inline", mime="application/json",
                            content=json.dumps(row, indent=2, default=str).encode())]
         if row.get("figure") in figures:
             details.append(_png_element(figures[row["figure"]], row["figure"] + ".png"))
         note = (row.get("output") or {}).get("note")
+        psd_diagnostic = row.get("diagnostics", {}).get("psd")
+        if psd_diagnostic:
+            psd = psd_diagnostic["result"]
+            if psd.get("ok"):
+                psd_note = (f"PSD: {psd['fmin']:g}-{psd['fmax']:g} Hz, mean across "
+                            f"{psd['n_channels']} EEG channels. Spectrum values in the JSON are V^2/Hz.")
+                resolution = psd.get("frequency_resolution_hz")
+                if resolution is not None:
+                    psd_note += f" Frequency spacing: {resolution:g} Hz."
+            else:
+                psd_note = f"PSD diagnostic failed: {psd.get('error', 'unknown error')}. Filter result is retained."
+            note = f"{note}\n\n{psd_note}" if note else psd_note
         labels = (row.get("output") or {}).get("labels")
         label_text = ""
         if isinstance(labels, list) and labels:
@@ -1701,13 +1787,7 @@ def _bids_format_recording(flat_path: str) -> tuple[str, str]:
     return bids_set, note
 
 
-async def _apply_dropped_codebook(saved: list) -> None:
-    """If a codebook was among the dropped files, apply it to the now-scoped recording.
-
-    A `<name>.codebook.json` (or any dropped `.json` carrying a "conditions" key) is applied via
-    set_codebook so it survives BIDS relocation and overrides the raw per-code events.tsv. No-op if
-    none was dropped or nothing is scoped.
-    """
+def _dropped_codebook_name(saved: list) -> str | None:
     cb_file = next((n for n in saved if n.lower().endswith(".codebook.json")), None)
     if cb_file is None:
         for n in saved:
@@ -1721,20 +1801,28 @@ async def _apply_dropped_codebook(saved: list) -> None:
                     break
             except Exception:
                 continue
-    if not cb_file:
-        return
+    return cb_file
+
+
+async def _apply_dropped_codebook(saved: list) -> bool:
+    """Bind an explicitly uploaded codebook to the recording the user scopes next."""
+    cb_file = _dropped_codebook_name(saved)
+    if not cb_file or not SCOPE.get("filepath"):
+        return False
     try:
         with open(os.path.join(DATA_DIR, cb_file)) as fh:
             cb = json.load(fh)
         res = set_codebook(conditions=cb.get("conditions"), responses=cb.get("responses"))
     except Exception as e:
         await cl.Message(content=f"⚠ Could not apply codebook `{cb_file}`: {e}").send()
-        return
+        return False
     if res.get("ok"):
         conds = ", ".join((cb.get("conditions") or {}).keys())
         await cl.Message(content=f"Applied codebook from `{cb_file}` (conditions: {conds}).").send()
+        return True
     else:
         await cl.Message(content=f"⚠ Codebook `{cb_file}` not applied: {res.get('error')}").send()
+        return False
 
 
 async def _handle_uploads(msg: cl.Message) -> bool:
@@ -1765,6 +1853,9 @@ async def _handle_uploads(msg: cl.Message) -> bool:
             await cl.Message(content=f"**Upload failed** for `{name}`: {e}").send()
     if not saved:
         return True
+    codebook_name = _dropped_codebook_name(saved)
+    if codebook_name:
+        cl.user_session.set("pending_codebook_uploads", [codebook_name])
 
     recordings = [n for n in saved if n.lower().endswith(_RECORDING_EXTS)]
     sidecars_only = [n for n in saved if n.lower().endswith(_SIDECAR_EXTS)]
@@ -1781,7 +1872,9 @@ async def _handle_uploads(msg: cl.Message) -> bool:
             await cl.Message(content=(
                 f"Received {listed} into `data-in/`. "
                 f"Use `/scope <recording>` to load the recording these belong to; "
-                f"the codebook / events file will be picked up automatically."
+                + ("The uploaded codebook will be applied when you scope it, including a leading "
+                   "`/sweep scope <recording>, ...` instruction." if codebook_name else
+                   "Matching metadata files are discovered when the recording is scoped.")
             )).send()
         return True
 
@@ -1806,11 +1899,7 @@ async def _handle_uploads(msg: cl.Message) -> bool:
             pass
         # Scope using the simple original name -- resolve_data_path's BIDS fallback finds it.
         await _handle_scope(primary)
-        # A codebook dropped alongside would otherwise be ORPHANED by the BIDS relocation (it stays
-        # flat, no longer beside the recording), so scope would fall back to the raw per-code
-        # events.tsv. Apply it explicitly to the now-scoped recording (persists beside it; takes
-        # precedence over the raw BIDS codebook).
-        await _apply_dropped_codebook(saved)
+        # _handle_scope applies a pending uploaded codebook after BIDS relocation.
     except Exception as exc:
         # FAIL LOUD: report the BIDS failure, still scope the flat file as a fallback.
         await cl.Message(content=(
