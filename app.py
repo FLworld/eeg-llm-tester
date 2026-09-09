@@ -855,14 +855,17 @@ def _review_ica_request(text: str) -> bool:
     t = text.strip()
     if re.fullmatch(r"/review-ica\b.*", t, re.I):
         return True
-    # verb-first: "review/overview [the] [ICA] [components]"
+    # verb-first: "review/overview [the] {ICA [noun] | noun}" — require an ICA-related token
+    # (ICA, or components/decomposition/line-up) so bare "review"/"overview" does NOT match.
+    # ICA needs no trailing whitespace, so "review ica" (ICA as the final token) also routes.
     if re.fullmatch(
-        r"(?:please\s+|can you\s+)?(?:review|overview)\s+(?:the\s+)?(?:ICA\s+)?"
-        r"(?:components?|overview|line[-\s]?up|decomposition)?[.!?]?", t, re.I):
+        r"(?:please\s+|can you\s+)?(?:review|overview)\s+(?:the\s+)?"
+        r"(?:ICA(?:\s+(?:components?|overview|line[-\s]?up|decomposition))?"
+        r"|components?|line[-\s]?up|decomposition)[.!?]?", t, re.I):
         return True
-    # noun-first: "ICA/component overview" / "ICA line-up"
+    # noun-first: "ICA/component review|overview|line-up"
     return bool(re.fullmatch(
-        r"(?:the\s+)?(?:ICA|components?)\s+(?:overview|line[-\s]?up)[.!?]?", t, re.I))
+        r"(?:the\s+)?(?:ICA|components?)\s+(?:review|overview|line[-\s]?up)[.!?]?", t, re.I))
 
 
 async def _handle_review_ica():
