@@ -81,6 +81,10 @@ def _report(name: str, kind: str, created: str, spec_name: str, results, scope: 
         from sweep import format_sweep_table
         rows = (results or {}).get("rows", []) if isinstance(results, dict) else []
         lines += ["", "## Sweep Results", "", format_sweep_table(rows)]
+        if any("psd" in row.get("diagnostics", {}) for row in rows):
+            lines += ["", "Filter-ending variants include a read-only PSD diagnostic from 0 Hz to Nyquist.",
+                      "`results.json` retains each diagnostic's arguments, frequency grid, mean spectrum",
+                      "in V^2/Hz, band powers in V^2, and any diagnostic error. PSD plots use uV^2/Hz."]
         lines += ["", "A sweep does not save `processed.fif`: the in-memory EEG belongs only to "
                   "the final variant, not to the complete comparison."]
     return "\n".join(lines) + "\n"

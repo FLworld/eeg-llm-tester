@@ -94,8 +94,10 @@ def validate_sweep_request(spec: dict, request: str, scope: dict | None = None) 
            for a in spec.get("axes", []) if isinstance(a, dict)):
         errors.append("The requested contrast is fixed; do not add an event_id/condition sweep axis.")
     if scope is not None:
-        conditions = {k.lower(): v for k, v in ((scope.get("codebook") or {}).get("conditions") or {}).items()}
-        if any(name not in conditions for name in names):
+        from tools import resolve_condition_codes
+        source_conditions = (scope.get("codebook") or {}).get("conditions") or {}
+        conditions = {name: resolve_condition_codes(name, source_conditions) for name in names}
+        if any(conditions[name] is None for name in names):
             errors.append("Scope the recording and supply a codebook defining both contrast conditions; do not invent event codes.")
         elif len(differences) == 1:
             from tools import _iter_codebook_codes
@@ -319,6 +321,27 @@ async def run_sweep(spec: dict, run_step) -> dict:
             row["error"] = failed.get("error", "a pipeline step failed")
             rows.append(row)
             continue
+        if final["tool"] == "filter_eeg":
+            # A read-only diagnostic of this variant, before the next clean-session reset.
+            psd_args = {"fmin": 0.0, "fmax": None}
+            started = time.perf_counter()
+            try:
+                psd, psd_image = await run_step("compute_psd", psd_args)
+                if not isinstance(psd, dict):
+                    psd = {"ok": False, "error": "PSD returned no result object."}
+                else:
+                    psd = dict(psd)
+                    psd_image = psd_image or psd.pop("image", None)
+                    if psd.get("error"):
+                        psd["ok"] = False
+            except Exception as exc:
+                psd, psd_image = {"ok": False, "error": str(exc)}, None
+            row["diagnostics"] = {"psd": {"tool": "compute_psd", "args": psd_args,
+                "result": psd, "elapsed_s": round(time.perf_counter() - started, 3)}}
+            if psd.get("ok") and psd_image:
+                figure_name = f"variant-{vi}-filter-psd"
+                images.append((figure_name, psd_image))
+                row["figure"] = figure_name
         if final["tool"] == "measure_component":
             amplitude = output.get("amplitude_uv")
             if isinstance(amplitude, bool) or not isinstance(amplitude, (int, float)) or not np.isfinite(amplitude):
@@ -333,8 +356,42 @@ async def run_sweep(spec: dict, run_step) -> dict:
             row["vs_ref_r"] = cp.get("min_r")
         rows.append(row)
 
-    return {"ok": True, "rows": rows, "images": images,
-            "summary": _aggregate(spec, rows), "n_variants": len(variants)}
+    result = {"ok": True, "rows": rows, "images": images,
+              "summary": _aggregate(spec, rows), "n_variants": len(variants)}
+    comparison = _plot_filter_psd_comparison(rows)
+    if comparison:
+        result["comparison_figure"] = "filter-psd-comparison"
+        images.append((result["comparison_figure"], comparison))
+    return result
+
+
+def _plot_filter_psd_comparison(rows: list[dict]) -> str | None:
+    """Overlay actual spectra in physical units, without scoring or normalizing variants."""
+    spectra = []
+    for row in rows:
+        psd = (row.get("diagnostics", {}).get("psd") or {}).get("result", {})
+        if not psd.get("ok"):
+            continue
+        freqs = np.asarray(psd.get("freqs_hz", []), dtype=float)
+        power = np.asarray(psd.get("mean_psd_v2_hz", []), dtype=float)
+        if freqs.ndim != 1 or power.shape != freqs.shape:
+            continue
+        valid = np.isfinite(freqs) & np.isfinite(power) & (power > 0)
+        if valid.any():
+            spectra.append((row["label"], freqs[valid], power[valid]))
+    if not spectra:
+        return None
+    import matplotlib.pyplot as plt
+    from tools import _fig_to_b64
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for label, freqs, power in spectra:
+        ax.semilogy(freqs, power * 1e12, label=label)
+    ax.set(xlabel="Frequency (Hz)", ylabel="PSD (uV^2/Hz)",
+           title="Filtered EEG: mean channel PSD")
+    ax.legend(fontsize=8)
+    ax.grid(True, which="both", alpha=0.3)
+    fig.tight_layout()
+    return _fig_to_b64(fig)
 
 
 def _result_metrics(result: dict) -> dict:
@@ -364,11 +421,14 @@ def format_sweep_table(rows: list[dict], success: str = "ok", failure: str = "fa
         keys = keys[:6]
     has_lat = any(r.get("latency_ms") is not None for r in rows)
     has_ref = any(r.get("vs_ref_r") is not None for r in rows)
+    has_psd = any("psd" in r.get("diagnostics", {}) for r in rows)
     head = ["variant"] + (["endpoint (uV)"] if erp else ["final tool"] + keys + ["final step (s)"])
     if has_lat:
         head.append("latency (ms)")
     if has_ref:
         head.append("vs-ref r")
+    if has_psd:
+        head.append("PSD diagnostic")
     head.append("status")
     def cell(value):
         if value is None:
@@ -385,6 +445,10 @@ def format_sweep_table(rows: list[dict], success: str = "ok", failure: str = "fa
             values.append(row.get("latency_ms"))
         if has_ref:
             values.append(row.get("vs_ref_r"))
+        if has_psd:
+            psd = (row.get("diagnostics", {}).get("psd") or {}).get("result")
+            values.append("available" if psd and psd.get("ok") else
+                          (f"failed: {psd.get('error', 'unknown error')}" if psd else "not run"))
         values.append(success if row.get("ok") else f"{failure} {row.get('error', '')}")
         lines.append("| " + " | ".join(cell(v) for v in values) + " |")
     return "\n".join(lines)

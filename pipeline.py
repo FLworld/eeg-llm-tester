@@ -207,6 +207,8 @@ Rules -- follow them exactly; they are what make the sweep trustworthy:
   A filter-only sweep ends in filter_eeg, an ICA algorithm sweep ends in run_ica (or review_ica
   if review was requested), a PSD sweep ends in compute_psd. Do NOT invent epoching, ERP
   computation or measure_component when the user did not ask for those operations.
+  Filter-ending sweeps automatically include a read-only PSD diagnostic and spectral comparison
+  in their outputs; do not add compute_psd merely to obtain that automatic diagnostic.
   For a requested ERP measurement, use measure_component with the stated channels/time window.
   It MUST follow compute_erp (one condition) or compute_difference_erp (contrast): create_epochs
   alone does NOT produce an averaged ERP. Every variant starts EMPTY: begin with load_eeg.
@@ -370,6 +372,39 @@ def _sanitize_sweep(spec: dict) -> list[str]:
         base.pop()
         spec.setdefault("notes", []).append(
             "Removed duplicate measure_component from base_pipeline; its identical endpoint runs once.")
+    window_axes = any(a.get("tool") in ("create_epochs", "compute_difference_erp")
+                      and a.get("param") in ("tmin", "tmax")
+                      for a in spec.get("axes", []) if isinstance(a, dict))
+    if isinstance(base, list) and not window_axes:
+        bin_labels, epoch_window = set(), None
+        for step in base + ([ep] if isinstance(ep, dict) else []):
+            if not isinstance(step, dict) or not isinstance(step.get("args", {}), dict):
+                continue
+            name, args = step.get("tool"), step.get("args", {})
+            if name == "load_eeg":
+                bin_labels, epoch_window = set(), None
+            elif name == "create_bins":
+                bins = args.get("bins")
+                bin_labels = {b["label"] for b in bins if isinstance(b, dict) and isinstance(b.get("label"), str)} if isinstance(bins, list) else set()
+                epoch_window = None
+            elif name == "create_epochs":
+                window = (args.get("tmin"), args.get("tmax"))
+                epoch_window = window if bin_labels and all(isinstance(v, (int, float)) for v in window) else None
+            elif name == "compute_difference_erp" and epoch_window is not None:
+                selected = []
+                for key in ("event_id_a", "event_id_b"):
+                    value = args.get(key)
+                    selected.extend(value if isinstance(value, list) else [value])
+                if selected and all(isinstance(label, str) and label in bin_labels for label in selected):
+                    previous = (args.get("tmin"), args.get("tmax"))
+                    if previous != epoch_window:
+                        # _epochs_for_event reuses these binned epochs; it does not re-epoch
+                        # using the redundant window arguments. Make that reuse explicit.
+                        args["tmin"], args["tmax"] = epoch_window
+                        spec.setdefault("notes", []).append(
+                            f"compute_difference_erp reuses the binned epochs: aligned its window "
+                            f"from {previous} to create_epochs {epoch_window} seconds. "
+                            "The component measurement window is unchanged.")
     return dropped
 
 

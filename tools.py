@@ -462,19 +462,41 @@ def _discover_bids_events(filepath: str):
     return {"conditions": conditions, "responses": responses, "_source_file": match}
 
 
-def _load_codebook_file(filepath: str):
-    """Option B: load a <basename>.codebook.json beside the recording, or None."""
-    p = _codebook_path(filepath)
-    if not os.path.exists(p):
-        return None
-    try:
-        with open(p) as fh:
-            cb = json.load(fh)
-        if isinstance(cb, dict) and "conditions" in cb:
-            return cb
-    except Exception:
-        pass
+def _load_codebook_file(filepath: str, requested_path: str | None = None):
+    """Prefer the recording's sidecar, then exact matching names at the input root."""
+    adjacent = _codebook_path(filepath)
+    roots = [DATA_DIR]
+    # Older native launchers point EEG_DATA_DIR at data/; uploads now live in data-in/.
+    if os.path.basename(os.path.normpath(DATA_DIR)) == "data":
+        roots.append(os.path.join(os.path.dirname(DATA_DIR), "data-in"))
+    names = [os.path.basename(adjacent)]
+    if requested_path:
+        names.append(os.path.basename(_codebook_path(requested_path)))
+    candidates = [adjacent] + [os.path.join(root, name) for root in roots for name in names]
+    for path in dict.fromkeys(candidates):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as fh:
+                cb = json.load(fh)
+            if isinstance(cb, dict) and "conditions" in cb:
+                return cb
+        except (OSError, ValueError):
+            continue
     return None
+
+
+def resolve_condition_codes(name: str, conditions: dict):
+    """Resolve exact labels first, then an unambiguous simple singular/plural alias."""
+    wanted = name.strip().casefold()
+    exact = [codes for label, codes in conditions.items() if label.strip().casefold() == wanted]
+    if exact:
+        return exact[0] if len(exact) == 1 else None
+    def singular(label):
+        label = label.strip().casefold()
+        return label[:-1] if label.endswith("s") and not label.endswith("ss") else label
+    matches = [codes for label, codes in conditions.items() if singular(label) == singular(wanted)]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _iter_codebook_codes(codebook: dict):
@@ -518,6 +540,7 @@ def scope_eeg(filepath: str) -> dict:
     can build create_bins with real codes. If no codebook is found, SCOPE['codebook'] is None and
     the caller should elicit one (Option A, `set_codebook`). Nothing is invented.
     """
+    requested_path = filepath
     filepath = resolve_data_path(filepath)
     kind, obj = _load_any(filepath)
     raw = obj
@@ -526,7 +549,7 @@ def scope_eeg(filepath: str) -> dict:
                     "ica": None, "bins": None, "filepath": filepath})
     codes = _event_inventory(filepath, obj)
 
-    codebook, source = _load_codebook_file(filepath), None
+    codebook, source = _load_codebook_file(filepath, requested_path), None
     if codebook is not None:
         source = "file"
     else:
@@ -704,12 +727,16 @@ def save_eeg(filepath: str) -> dict:
             "sfreq": float(obj.info["sfreq"]), "n_channels": len(obj.ch_names)}
 
 
-def compute_psd(fmin: float = 1.0, fmax: float = 45.0) -> dict:
+def compute_psd(fmin: float = 1.0, fmax: float | None = 45.0) -> dict:
     """Compute power spectral density and per-band power, with a plot.
 
     Works on continuous or epoched data (epoched: PSD averaged over epochs).
+    fmax=None uses Nyquist. Numeric spectrum and band powers remain in SI units;
+    plots convert the spectrum to microvolt squared per Hz.
     """
     kind, obj = _active()
+    if fmax is None:
+        fmax = float(obj.info["sfreq"]) / 2.0
     picks = mne.pick_types(obj.info, eeg=True, exclude="bads")
     if len(picks) == 0:
         picks = mne.pick_types(obj.info, meg=False, eeg=True, misc=True)
@@ -734,7 +761,7 @@ def compute_psd(fmin: float = 1.0, fmax: float = 45.0) -> dict:
             }
 
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.semilogy(freqs, mean_psd, color="#1f77b4")
+    ax.semilogy(freqs, mean_psd * 1e12, color="#1f77b4")
     ax.set(xlabel="Frequency (Hz)", ylabel="PSD (µV²/Hz)",
            title=f"Mean PSD across {len(picks)} channels")
     for name, (lo, hi) in BANDS.items():
@@ -746,6 +773,11 @@ def compute_psd(fmin: float = 1.0, fmax: float = 45.0) -> dict:
         "fmin": fmin,
         "fmax": fmax,
         "n_channels": int(len(picks)),
+        "freqs_hz": freqs.tolist(),
+        "mean_psd_v2_hz": mean_psd.tolist(),
+        "psd_units": "V^2/Hz",
+        "band_power_units": "V^2",
+        "frequency_resolution_hz": float(freqs[1] - freqs[0]) if len(freqs) > 1 else None,
         "band_power": band_power,
         "image": _fig_to_b64(fig),
     }
@@ -3735,7 +3767,7 @@ TOOL_SCHEMAS = [
                 "type": "object",
                 "properties": {
                     "fmin": {"type": "number", "description": "Low frequency bound (Hz)."},
-                    "fmax": {"type": "number", "description": "High frequency bound (Hz)."},
+                    "fmax": {"type": ["number", "null"], "description": "High frequency bound (Hz); null uses Nyquist."},
                 },
             },
         },
