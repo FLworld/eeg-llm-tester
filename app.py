@@ -1331,7 +1331,8 @@ def _endpoint_in_plan(spec: dict) -> bool:
 def _batch_inspect_request(text: str) -> str | None:
     """Return the argument string for a batch-inspect request, else None."""
     t = text.strip()
-    m = re.match(r"/batch-inspect\b(.*)", t, re.I)
+    # accept both orderings (/batch-inspect and the easily-transposed /inspect-batch)
+    m = re.match(r"/(?:batch-inspect|inspect-batch)\b(.*)", t, re.I)
     if m:
         return m.group(1).strip()
     m = re.fullmatch(r"(?:please\s+|can you\s+)?inspect\s+(?:batch\s+)?subject\s+"

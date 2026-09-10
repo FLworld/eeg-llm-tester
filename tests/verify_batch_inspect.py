@@ -18,6 +18,7 @@ t = app._batch_inspect_request
 check(t("/batch-inspect sub-003") == "sub-003", "command with subject")
 check(t("/batch-inspect") == "", "bare command -> usage")
 check(t("/batch-inspect run1 sub-003") == "run1 sub-003", "command with run + subject")
+check(t("/inspect-batch run1 sub-003") == "run1 sub-003", "transposed alias /inspect-batch works")
 check(t("inspect subject sub-005 from the batch") == "sub-005", "NL form")
 check(t("inspect batch subject sub-002") == "sub-002", "NL 'batch subject' form")
 check(t("/batch n170 data") is None, "plain /batch must NOT match /batch-inspect")
