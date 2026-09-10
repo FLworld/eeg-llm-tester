@@ -1,0 +1,6 @@
+{
+  "_note": "Example lab conventions for the onboarding demo. Load with: /lab-rules demo_lab_rules.json",
+  "require_steps": ["run_ica"],
+  "order": ["filter_eeg", "set_reference", "run_ica"],
+  "param_equals": { "filter_eeg": { "h_freq": 30.0 } }
+}
