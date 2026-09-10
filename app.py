@@ -1431,16 +1431,27 @@ async def _handle_batch_inspect(arg: str):
         await cl.Message(content=(f"`{sub}` is now loaded (no ERP/measurement step in the plan to "
                                   "replot). Run any command to inspect it.")).send()
         return
+    images: list = []
+    endpoint_uv = None
     for step in steps:
-        r, _ = await _run_tool(step["tool"], step.get("args", {}) or {})
+        r, img = await _run_tool(step["tool"], step.get("args", {}) or {})
         if r.get("ok") is False:
             await cl.Message(content=(f"Re-running `{step['tool']}` on `{sub}` failed: "
                              f"{r.get('error')}. The subject is still loaded for manual "
                              "inspection.")).send()
             return
-    await cl.Message(content=(f"`{sub}` is loaded and shown above — its own ERP + endpoint, "
-                     "re-derived from the saved epochs (matches the batch). Run any command "
-                     "(e.g. `measure_component`, `/review-ica`, `compute_psd`) to inspect further.")).send()
+        if img:  # surface the plot in a visible message, not just the collapsed tool step
+            images.append(_png_element(img, f"{sub}-{step['tool']}.png"))
+        if step["tool"] == "measure_component" and r.get("amplitude_uv") is not None:
+            endpoint_uv = r.get("amplitude_uv")
+    ep_txt = f", endpoint {endpoint_uv:.3f} µV" if isinstance(endpoint_uv, (int, float)) else ""
+    out = cl.Message(content=(
+        f"`{sub}` re-derived from its saved recording (matches the batch{ep_txt}). The subject is "
+        "loaded — run any command (e.g. `measure_component`, `/review-ica`, `compute_psd`) to "
+        "inspect further."))
+    if images:
+        out.elements = images
+    await out.send()
 
 
 async def _handle_name_batch(arg: str):
