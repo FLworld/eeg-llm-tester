@@ -26,5 +26,13 @@ check(n('/codebook {"a_b": 1}') == '/codebook {"a_b": 1}', "JSON arg underscore 
 check(n("review the ica components") == "review the ica components", "NL text untouched")
 check(n("") == "", "empty untouched")
 
+# Guard: @cl.on_message must decorate on_message itself, not a helper defined just below it.
+# (A helper inserted between the decorator and on_message silently breaks EVERY message.)
+import re as _re2  # noqa: E402
+import pathlib as _pl  # noqa: E402
+_src = _pl.Path(app.__file__).read_text()
+check(_re2.search(r"@cl\.on_message\s*\nasync def on_message\(", _src) is not None,
+      "@cl.on_message decorates on_message (not an intervening helper)")
+
 print("\nRESULT:", "PASS" if not FAILS else f"FAIL ({len(FAILS)})")
 sys.exit(1 if FAILS else 0)

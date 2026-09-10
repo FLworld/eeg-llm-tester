@@ -2092,7 +2092,6 @@ async def _handle_uploads(msg: cl.Message) -> bool:
     return True
 
 
-@cl.on_message
 def _normalize_slash_command(text: str) -> str:
     """Let users type '_' or '-' in a slash command (e.g. /lab_rules == /lab-rules). Only the
     FIRST token is normalized, so filenames/JSON args with underscores are untouched; text that is
@@ -2103,6 +2102,7 @@ def _normalize_slash_command(text: str) -> str:
     return cmd.replace("_", "-") + (sep + rest if sep else "")
 
 
+@cl.on_message
 async def on_message(msg: cl.Message):
     text = _normalize_slash_command(msg.content.strip())
 
