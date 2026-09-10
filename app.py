@@ -36,7 +36,7 @@ from pipeline import (
 )
 from prompt import EEG_SYSTEM_PROMPT
 from rag import retrieve_context
-from batch import run_batch
+from batch import BATCHES_DIR, run_batch
 from exports import export_analysis
 from engines import (ENGINE_CHOICES, eeglab_ica_availability, engine_review, engine_runtime_errors)
 from qc import (LAB_RULE_KEYS, discover_lab_rules, find_lab_rules, lint_config,
@@ -1306,6 +1306,11 @@ async def _handle_batch(arg: str):
         if ga.get("endpoint_uv") is not None:
             line += f"; group endpoint {ga['endpoint_uv']:.3f} µV"
         content.append(line)
+    ok_subs = [r["sub"] for r in rows if r.get("ok")]
+    if ok_subs:
+        content += ["", f"Inspect any subject's own ERP + endpoint with "
+                    f"`/batch-inspect {ok_subs[0]}` (loads that subject for further commands)."]
+    cl.user_session.set("last_batch_dir", result["out_dir"])
     elements = ([_png_element(result["grand_average_png"], "grand_average.png")]
                 if result.get("grand_average_png") else [])
     await cl.Message(content="\n".join(content), elements=elements).send()
@@ -1314,6 +1319,127 @@ async def _handle_batch(arg: str):
 def _endpoint_in_plan(spec: dict) -> bool:
     return any(isinstance(s, dict) and s.get("tool") == "measure_component"
               for s in (spec.get("pipeline") or []))
+
+
+# --------------------------------------------------------------------------- #
+# Inspect one subject after a batch. The batch saves each subject's fully-processed recording
+# (batches/<run>/<sub>/state_*.fif). Re-averaging those saved epochs is DETERMINISTIC, so we
+# faithfully reproduce that subject's ERP + endpoint (no re-running the stochastic ICA fit), then
+# leave the subject loaded so the expert can drill in with any normal command.
+# --------------------------------------------------------------------------- #
+def _batch_inspect_request(text: str) -> str | None:
+    """Return the argument string for a batch-inspect request, else None."""
+    t = text.strip()
+    m = re.match(r"/batch-inspect\b(.*)", t, re.I)
+    if m:
+        return m.group(1).strip()
+    m = re.fullmatch(r"(?:please\s+|can you\s+)?inspect\s+(?:batch\s+)?subject\s+"
+                     r"(\S+)(?:\s+(?:from|in)\s+(?:the\s+)?(?:last\s+)?batch)?[.!?]?", t, re.I)
+    return m.group(1) if m else None
+
+
+def _resolve_batch_run(token: str | None) -> str | None:
+    """Resolve a run name/path to a batch run dir. None token -> the session's last run, else the
+    most recent under BATCHES_DIR."""
+    if token:
+        for cand in (token, os.path.join(BATCHES_DIR, token)):
+            if os.path.isdir(cand):
+                return cand
+        return None
+    last = cl.user_session.get("last_batch_dir")
+    if last and os.path.isdir(last):
+        return last
+    if os.path.isdir(BATCHES_DIR):
+        runs = [os.path.join(BATCHES_DIR, d) for d in os.listdir(BATCHES_DIR)
+                if os.path.isdir(os.path.join(BATCHES_DIR, d))]
+        if runs:
+            return max(runs, key=os.path.getmtime)
+    return None
+
+
+async def _handle_batch_inspect(arg: str):
+    """Reload one subject from a batch run and show its own ERP + endpoint (deterministically)."""
+    parts = arg.split()
+    if not parts:
+        await cl.Message(content=(
+            "Usage: `/batch-inspect <subject>` (e.g. `/batch-inspect sub-003`), or "
+            "`/batch-inspect <run> <subject>` to pick a specific run. Defaults to your last batch."
+        )).send()
+        return
+    # Accept "<sub>" or "<run> <sub>"; the LAST token is the subject.
+    sub = parts[-1]
+    run_token = " ".join(parts[:-1]) or None
+    run_dir = _resolve_batch_run(run_token)
+    if run_dir is None:
+        await cl.Message(content=("No batch run found. Run `/batch <recipe> <dataset>` first, or "
+                                  "pass an existing run name.")).send()
+        return
+
+    summary_path = os.path.join(run_dir, "summary.json")
+    try:
+        with open(summary_path) as fh:
+            summary = json.load(fh)
+    except Exception as exc:
+        await cl.Message(content=f"Could not read `{summary_path}`: {exc}").send()
+        return
+    rows = summary.get("rows") or []
+    row = next((r for r in rows if r.get("sub") == sub), None)
+    if row is None:
+        subs = ", ".join(r.get("sub", "?") for r in rows) or "(none)"
+        await cl.Message(content=f"Subject `{sub}` is not in run "
+                         f"`{os.path.basename(run_dir)}`. Subjects: {subs}.").send()
+        return
+
+    # 1) Report the subject's stored batch result.
+    lines = [f"**Inspecting `{sub}`** (run `{os.path.basename(run_dir)}`)."]
+    if not row.get("ok"):
+        lines.append(f"This subject FAILED in the batch: {row.get('error', 'unknown error')}.")
+    ep = row.get("endpoint_uv")
+    if isinstance(ep, (int, float)):
+        lat = row.get("latency_ms")
+        lines.append(f"- Batch endpoint: **{ep:.3f} µV**" + (f" at {lat} ms" if lat else ""))
+    if row.get("qc"):
+        lines.append("- QC: " + ", ".join(f"{k}={v}" for k, v in row["qc"].items()))
+    if row.get("warnings"):
+        lines.append("- Scope warnings: " + "; ".join(map(str, row["warnings"])))
+    await cl.Message(content="\n".join(lines)).send()
+
+    # 2) Reload the subject's saved processed recording into the session.
+    sub_dir = os.path.join(run_dir, sub)
+    fifs = sorted(f for f in os.listdir(sub_dir) if f.endswith(".fif")) if os.path.isdir(sub_dir) else []
+    if not fifs:
+        await cl.Message(content=(f"No saved recording for `{sub}` (looked in `{sub_dir}`). "
+                                  "The batch may have run with derivatives disabled.")).send()
+        return
+    state_path = os.path.join(sub_dir, fifs[0])
+    result, _ = await _run_tool("load_eeg", {"filepath": state_path})
+    if result.get("ok") is False:
+        await cl.Message(content=f"Could not load `{state_path}`: {result.get('error')}").send()
+        return
+
+    # 3) Deterministically re-derive this subject's ERP + endpoint. The saved recording already has
+    #    all preprocessing baked in (filter/ICA/re-reference), so re-running only the segmentation +
+    #    averaging + measurement steps reproduces the exact batch endpoint with no stochastic re-fit.
+    #    If the saved recording is already epoched, skip the (raw-only) binning/epoching steps.
+    seg_tools = () if result.get("kind") == "epochs" else ("create_bins", "create_epochs")
+    endpoint_tools = seg_tools + ("compute_difference_erp", "compute_erp", "compute_psd",
+                                  "measure_component")
+    steps = [s for s in (summary.get("spec", {}).get("pipeline") or [])
+             if isinstance(s, dict) and s.get("tool") in endpoint_tools]
+    if not steps:
+        await cl.Message(content=(f"`{sub}` is now loaded (no ERP/measurement step in the plan to "
+                                  "replot). Run any command to inspect it.")).send()
+        return
+    for step in steps:
+        r, _ = await _run_tool(step["tool"], step.get("args", {}) or {})
+        if r.get("ok") is False:
+            await cl.Message(content=(f"Re-running `{step['tool']}` on `{sub}` failed: "
+                             f"{r.get('error')}. The subject is still loaded for manual "
+                             "inspection.")).send()
+            return
+    await cl.Message(content=(f"`{sub}` is loaded and shown above — its own ERP + endpoint, "
+                     "re-derived from the saved epochs (matches the batch). Run any command "
+                     "(e.g. `measure_component`, `/review-ica`, `compute_psd`) to inspect further.")).send()
 
 
 def _run_batch_sync(spec: dict, dataset_dir: str) -> dict:
@@ -1964,6 +2090,11 @@ async def on_message(msg: cl.Message):
         return
     if text.startswith("/recipes"):
         await _handle_recipes()
+        return
+    # /batch-inspect must precede /batch (prefix), and the NL form is caught before agentic chat.
+    _bi = _batch_inspect_request(text)
+    if _bi is not None:
+        await _handle_batch_inspect(_bi)
         return
     if text.startswith("/batch"):
         await _handle_batch(text[len("/batch"):].strip())

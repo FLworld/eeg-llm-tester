@@ -270,6 +270,10 @@ def _load_any(filepath: str):
         return "raw", mne.io.read_raw_edf(filepath, preload=True)
     if fp.endswith(".bdf"):
         return "raw", mne.io.read_raw_bdf(filepath, preload=True)
+    if fp.endswith(("-epo.fif", "_epo.fif", "-epo.fif.gz", "_epo.fif.gz")):
+        # Epoched FIF (as written by save_eeg for epoched data) — reload as epochs, preserving
+        # the bin/condition event_id so a contrast can be re-averaged deterministically.
+        return "epochs", mne.read_epochs(filepath, preload=True, verbose="ERROR")
     if fp.endswith(".fif") or fp.endswith(".fif.gz"):
         return "raw", mne.io.read_raw_fif(filepath, preload=True)
     if fp.endswith(".set"):
