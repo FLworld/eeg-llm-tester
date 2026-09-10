@@ -2093,8 +2093,18 @@ async def _handle_uploads(msg: cl.Message) -> bool:
 
 
 @cl.on_message
+def _normalize_slash_command(text: str) -> str:
+    """Let users type '_' or '-' in a slash command (e.g. /lab_rules == /lab-rules). Only the
+    FIRST token is normalized, so filenames/JSON args with underscores are untouched; text that is
+    not a slash command is returned unchanged."""
+    if not text.startswith("/"):
+        return text
+    cmd, sep, rest = text.partition(" ")
+    return cmd.replace("_", "-") + (sep + rest if sep else "")
+
+
 async def on_message(msg: cl.Message):
-    text = msg.content.strip()
+    text = _normalize_slash_command(msg.content.strip())
 
     # --- uploaded/dragged files: save into DATA_DIR + auto-scope the primary recording ---
     if msg.elements:
