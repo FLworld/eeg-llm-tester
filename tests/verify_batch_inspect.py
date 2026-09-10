@@ -21,7 +21,16 @@ check(t("/batch-inspect run1 sub-003") == "run1 sub-003", "command with run + su
 check(t("inspect subject sub-005 from the batch") == "sub-005", "NL form")
 check(t("inspect batch subject sub-002") == "sub-002", "NL 'batch subject' form")
 check(t("/batch n170 data") is None, "plain /batch must NOT match /batch-inspect")
+check(t("/name-batch pilot") is None, "/name-batch must NOT match /batch-inspect")
 check(t("review the data") is None, "unrelated text does not match")
+
+# /name-batch name validation (mirrors _handle_name_batch: reject spaces/slashes/'.'/'..')
+import re as _re  # noqa: E402
+_valid = lambda n: n not in (".", "..") and bool(_re.fullmatch(r"[A-Za-z0-9._-]+", n))
+for n in ("pilot-v1", "n170_cohort", "runA.2"):
+    check(_valid(n), f"valid batch name: {n!r}")
+for n in ("..", ".", "has space", "a/b", "", "../x"):
+    check(not _valid(n), f"rejected batch name: {n!r}")
 
 # Epochs save -> reload roundtrip (guards _load_any epochs support + bin-label preservation)
 import numpy as np  # noqa: E402

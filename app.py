@@ -1309,7 +1309,8 @@ async def _handle_batch(arg: str):
     ok_subs = [r["sub"] for r in rows if r.get("ok")]
     if ok_subs:
         content += ["", f"Inspect any subject's own ERP + endpoint with "
-                    f"`/batch-inspect {ok_subs[0]}` (loads that subject for further commands)."]
+                    f"`/batch-inspect {ok_subs[0]}` (loads that subject for further commands). "
+                    f"Name this run with `/name-batch <name>` to refer to it later."]
     cl.user_session.set("last_batch_dir", result["out_dir"])
     elements = ([_png_element(result["grand_average_png"], "grand_average.png")]
                 if result.get("grand_average_png") else [])
@@ -1440,6 +1441,46 @@ async def _handle_batch_inspect(arg: str):
     await cl.Message(content=(f"`{sub}` is loaded and shown above — its own ERP + endpoint, "
                      "re-derived from the saved epochs (matches the batch). Run any command "
                      "(e.g. `measure_component`, `/review-ica`, `compute_psd`) to inspect further.")).send()
+
+
+async def _handle_name_batch(arg: str):
+    """Rename the just-run batch (its auto timestamp) to a memorable name."""
+    name = arg.strip()
+    if not name:
+        await cl.Message(content=("Usage: `/name-batch <name>` — renames your last batch run so you "
+                                  "can refer to it, e.g. `/name-batch pilot-v1` then "
+                                  "`/batch-inspect pilot-v1 sub-003`.")).send()
+        return
+    if name in (".", "..") or not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+        await cl.Message(content=("Use only letters, digits, dash, underscore or dot in a batch "
+                                  "name (no spaces or slashes; not `.`/`..`).")).send()
+        return
+    src = cl.user_session.get("last_batch_dir")
+    if not src or not os.path.isdir(src):
+        src = _resolve_batch_run(None)  # fall back to the newest run on disk
+    if not src:
+        await cl.Message(content="No batch run to name. Run `/batch <recipe> <dataset>` first.").send()
+        return
+    dst = os.path.join(BATCHES_DIR, name)
+    if os.path.dirname(os.path.abspath(dst)) != os.path.abspath(BATCHES_DIR):
+        await cl.Message(content="Invalid batch name.").send()
+        return
+    if os.path.abspath(dst) == os.path.abspath(src):
+        await cl.Message(content=f"That run is already named `{name}`.").send()
+        return
+    if os.path.exists(dst):
+        await cl.Message(content=(f"A run named `{name}` already exists — pick another name "
+                                  "(or delete the old one).")).send()
+        return
+    try:
+        os.rename(src, dst)
+    except Exception as exc:
+        await cl.Message(content=f"Could not rename the run: {exc}").send()
+        return
+    cl.user_session.set("last_batch_dir", dst)
+    await cl.Message(content=(f"Renamed the batch run to **`{name}`**. Inspect it with "
+                     f"`/batch-inspect {name} <subject>` (or just `/batch-inspect <subject>` while "
+                     "it's your most recent run).")).send()
 
 
 def _run_batch_sync(spec: dict, dataset_dir: str) -> dict:
@@ -2092,6 +2133,9 @@ async def on_message(msg: cl.Message):
         await _handle_recipes()
         return
     # /batch-inspect must precede /batch (prefix), and the NL form is caught before agentic chat.
+    if text.startswith("/name-batch"):
+        await _handle_name_batch(text[len("/name-batch"):].strip())
+        return
     _bi = _batch_inspect_request(text)
     if _bi is not None:
         await _handle_batch_inspect(_bi)

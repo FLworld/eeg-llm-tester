@@ -87,8 +87,9 @@ Review the drafted plan, then `/run`.
 3. `/plan …` or `/sweep …`, review, `/run`.
 
 Useful commands: `/params <tool>` (what a tool takes), `/sweep` (parameter sweeps),
-`/batch <dataset-dir>` (a whole cohort), `/batch-inspect <subject>` (reopen one subject from the
-last batch — its own ERP + endpoint, ready for further commands), `/engine mne|erplab`,
+`/batch <dataset-dir>` (a whole cohort), `/name-batch <name>` (label the batch you just ran),
+`/batch-inspect [<name>] <subject>` (reopen one subject — its own ERP + endpoint, ready for
+further commands), `/engine mne|erplab`,
 `/save-plan <name>` + `/recipes` (save and reuse a pipeline). Reference PDFs can be dropped in
 `docs/` and indexed with `make ingest`.
 
