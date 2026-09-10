@@ -7,6 +7,9 @@ machine — your recordings never leave it.**
 The app runs in Docker; the language model runs in **Ollama on your machine** (Docker can't use the
 GPU directly, so Ollama stays on the host and the app connects to it).
 
+**▶ Watch the walkthrough:** a full feature demo is attached to the latest release —
+https://github.com/FLworld/eeg-llm-tester/releases/latest (download `eeg-assistant-walkthrough.mp4`).
+
 ---
 
 ## Prerequisites
